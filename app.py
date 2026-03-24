@@ -11,7 +11,7 @@ st.title("📊 UpDown Signals")
 st.write("Analisi tecnica + fondamentale + gestione del rischio")
 
 # ===== INPUT =====
-tickers = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX"]
+tickers = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX","1BBVA"]
 ticker = st.selectbox("Seleziona un Titolo", tickers)
 period = st.selectbox("Periodo", ["3mo","6mo","1y"])
 
