@@ -1,4 +1,5 @@
 # app.py
+import re
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -7,7 +8,7 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 
 # =========================
-# CONFIG (deve essere la prima chiamata Streamlit)
+# CONFIG (prima di ogni altro st.*)
 # =========================
 st.set_page_config(page_title="UpDown Signals", layout="wide")
 
@@ -18,58 +19,67 @@ st.caption("⚠️ Educational only – non è consulenza finanziaria.")
 # =========================
 # UTILS
 # =========================
-def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rende le colonne yfinance standard (Open, High, Low, Close, Volume).
-    - Flatten MultiIndex (se presente)
-    - Rinomina qualsiasi variante (lower/upper/suffissi)
-    - Fallback: se manca Close ma c'è Adj Close, usa quello
-    """
-    if df is None or df.empty:
-        return df
-
-    # 1) Flatten MultiIndex se necessario
-    if isinstance(df.columns, pd.MultiIndex):
-        flat_cols = []
-        for col in df.columns:
-            # col è una tupla, rimuovi None/'' e unisci con "_"
-            parts = [str(x) for x in col if x not in (None, "", " ")]
-            name = "_".join(parts) if parts else "col"
-            flat_cols.append(name)
-        df.columns = flat_cols
-
-    # 2) Mappa nomi a canonicali
-    rename_map = {}
-    for c in df.columns:
-        lc = c.lower().strip()
-        if lc == "open" or lc.endswith("_open"):
-            rename_map[c] = "Open"
-        elif lc == "high" or lc.endswith("_high"):
-            rename_map[c] = "High"
-        elif lc == "low" or lc.endswith("_low"):
-            rename_map[c] = "Low"
-        elif lc == "close" or lc.endswith("_close"):
-            rename_map[c] = "Close"
-        elif lc in ("adj close", "adj_close") or lc.endswith("_adj close") or lc.endswith("_adj_close"):
-            rename_map[c] = "Adj Close"
-        elif lc == "volume" or lc.endswith("_volume"):
-            rename_map[c] = "Volume"
-
-    df = df.rename(columns=rename_map)
-
-    # 3) Fallback: se non c'è Close ma c'è Adj Close → usa Adj Close
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df["Close"] = df["Adj Close"]
-
-    return df
-
 def safe_ticker_info(t):
-    """Restituisce un dict info sempre valido (anche se yfinance fallisce)."""
+    """Restituisce un dict info sempre valido (evita crash se yfinance fallisce)."""
     try:
         d = t.info
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Se le colonne sono MultiIndex, le appiattisce in stringhe leggibili."""
+    if isinstance(df.columns, pd.MultiIndex):
+        flat_cols = []
+        for col in df.columns:
+            parts = [str(x) for x in col if x not in (None, "", " ")]
+            flat_cols.append("_".join(parts) if parts else "col")
+        df = df.copy()
+        df.columns = flat_cols
+    return df
+
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Restituisce un DataFrame con colonne canonicali: Open, High, Low, Close, Volume (+Adj Close se disponibile).
+    Riconosce i nomi indipendentemente dalla posizione del ticker (es. 'AAPL_Close' o 'Close_AAPL').
+    Se 'Close' manca ma esiste 'Adj Close', usa quello come Close.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = flatten_columns(df)
+
+    # Trova la prima colonna che corrisponde a ciascun tipo
+    def find_first(pattern_fn):
+        for c in df.columns:
+            lc = c.lower()
+            # tokenizza per separatori non alfabetici (underscore, spazi, etc.)
+            tokens = re.findall(r"[a-z]+", lc)
+            if pattern_fn(tokens):
+                return c
+        return None
+
+    col_map = {}
+
+    # Preferisci 'Close' "puro" a 'Adj Close'
+    col_map["Open"]   = find_first(lambda t: "open" in t)
+    col_map["High"]   = find_first(lambda t: "high" in t)
+    col_map["Low"]    = find_first(lambda t: "low" in t)
+    col_map["Close"]  = find_first(lambda t: ("close" in t) and ("adj" not in t))
+    col_map["Adj Close"] = find_first(lambda t: ("close" in t) and ("adj" in t))
+    col_map["Volume"] = find_first(lambda t: "volume" in t)
+
+    # Costruisci un DF canonico con le colonne trovate
+    out = pd.DataFrame(index=df.index)
+    for k, src in col_map.items():
+        if src is not None:
+            out[k] = df[src].astype(float)
+
+    # Fallback: se manca Close ma c'è Adj Close, usa quello
+    if "Close" not in out.columns and "Adj Close" in out.columns:
+        out["Close"] = out["Adj Close"]
+
+    return out
 
 # =========================
 # INPUT
@@ -120,10 +130,7 @@ if not df_heat.empty:
         color_continuous_scale=["red","black","green"],
         color_continuous_midpoint=0
     )
-    fig_heat.update_layout(
-        template="plotly_dark",
-        margin=dict(t=30, l=10, r=10, b=10)
-    )
+    fig_heat.update_layout(template="plotly_dark", margin=dict(t=30, l=10, r=10, b=10))
     st.plotly_chart(fig_heat, use_container_width=True)
 else:
     st.info("Nessun dato disponibile per la heatmap.")
@@ -134,19 +141,18 @@ st.markdown("---")
 # ANALISI DETTAGLIO
 # =========================
 if st.button("Analizza"):
-    # Scarica storico (usa auto_adjust=False per mantenere Close + Adj Close distinti)
-    data = yf.download(ticker, period=period, progress=False, auto_adjust=False)
+    # Nota: group_by='column' tende a restituire colonne semplici per 1 ticker,
+    # ma alcune versioni creano un MultiIndex; la normalizzazione robusta sopra lo gestisce.
+    data_raw = yf.download(ticker, period=period, progress=False, auto_adjust=False, group_by="column")
 
-    if data is None or data.empty:
+    if data_raw is None or data_raw.empty:
         st.error("Errore nel recupero dati")
     else:
-        # Normalizza colonne per evitare KeyError: 'Close'
-        data = normalize_ohlcv(data)
+        data = normalize_ohlcv(data_raw)
 
-        # Debug utile se qualcosa va storto
-        if "Close" not in data.columns:
+        if data is None or data.empty or "Close" not in data.columns:
             st.error("La colonna 'Close' non è presente nei dati scaricati.")
-            st.write("Colonne disponibili:", list(data.columns))
+            st.write("Colonne originali:", list(flatten_columns(data_raw).columns))
             st.stop()
 
         # Guardrail: servono almeno 20 barre
@@ -157,7 +163,6 @@ if st.button("Analizza"):
         close = data["Close"].astype(float)
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
-
         upper = ma20 + 2 * std20
         lower = ma20 - 2 * std20
 
@@ -270,7 +275,6 @@ if st.button("Analizza"):
             else:
                 st.warning("⚖️ HOLD")
 
-            # LIVELLI DINAMICI
             if "BUY" in final_signal:
                 st.subheader("🎯 Livelli operativi (dinamici)")
                 c1, c2 = st.columns(2)
