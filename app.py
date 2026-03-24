@@ -3,12 +3,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.express as px
 
 # ===== CONFIG =====
 st.set_page_config(page_title="UpDown Signals", layout="wide")
 
 st.title("📊 UpDown Signals")
-st.write("Analisi tecnica + fondamentale + gestione del rischio")
+st.write("il tuo assistente per segnali di trading basati su analisi tecnica e fondamentale")
 
 # ===== INPUT =====
 col1, col2, col3= st.columns([1,1,2])
@@ -19,6 +20,57 @@ with col2:
     ticker = st.selectbox("Seleziona un Titolo", tickers)
 with col3:
     period = st.selectbox("Periodo", ["3mo","6mo","1y"])
+
+# =========================
+# 🗺️ HEATMAP MERCATO
+# =========================
+
+st.subheader("🗺️ Market Heatmap (Daily)")
+
+heatmap_data = []
+
+for t in tickers:
+    try:
+        stock = yf.Ticker(t)
+        info = stock.info
+
+        price = info.get("currentPrice", None)
+        prev = info.get("previousClose", None)
+        market_cap = info.get("marketCap", 1)
+        sector = info.get("sector", "Other")
+
+        if price and prev:
+            change = (price - prev) / prev
+
+            heatmap_data.append({
+                "Sector": sector,
+                "Ticker": t,
+                "Change": change,
+                "MarketCap": market_cap
+            })
+    except:
+        pass
+
+df_heat = pd.DataFrame(heatmap_data)
+
+if not df_heat.empty:
+    fig_heat = px.treemap(
+        df_heat,
+        path=["Sector","Ticker"],
+        values="MarketCap",
+        color="Change",
+        color_continuous_scale=["red","black","green"],
+        color_continuous_midpoint=0
+    )
+
+    fig_heat.update_layout(
+        template="plotly_dark",
+        margin=dict(t=30, l=10, r=10, b=10)
+    )
+
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+st.markdown("---")
 
 # ===== ANALISI =====
 if st.button("Analizza"):
