@@ -1,113 +1,115 @@
+# app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import timedelta
+import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as go
 
-# ============ CONFIG ============
+# =========================
+# CONFIG (deve essere la prima chiamata Streamlit)
+# =========================
 st.set_page_config(page_title="UpDown Signals", layout="wide")
+
 st.title("📊 UpDown Signals")
 st.write("Il tuo assistente per segnali di trading basati su analisi tecnica e fondamentale")
 st.caption("⚠️ Educational only – non è consulenza finanziaria.")
 
-# ============ INPUT ============
-col1, col2, col3 = st.columns([1,1,2])
-with col1:
-    TICKERS = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX","BBVA"]
-with col2:
-    ticker = st.selectbox("Seleziona un Titolo", TICKERS, index=0)
-with col3:
-    period = st.selectbox("Periodo", ["3mo","6mo","1y"], index=0)
+# =========================
+# UTILS
+# =========================
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rende le colonne yfinance standard (Open, High, Low, Close, Volume).
+    - Flatten MultiIndex (se presente)
+    - Rinomina qualsiasi variante (lower/upper/suffissi)
+    - Fallback: se manca Close ma c'è Adj Close, usa quello
+    """
+    if df is None or df.empty:
+        return df
 
-# ============ UTILS ============
-@st.cache_data(ttl=300)
-def fetch_prices_for_heatmap(tickers):
-    """Scarica prezzi ultimi 2 giorni per tutti i tickers (unica call)."""
-    # 2d per avere prev close + ultimo close
-    df = yf.download(tickers, period="2d", group_by="ticker", auto_adjust=False, progress=False)
+    # 1) Flatten MultiIndex se necessario
+    if isinstance(df.columns, pd.MultiIndex):
+        flat_cols = []
+        for col in df.columns:
+            # col è una tupla, rimuovi None/'' e unisci con "_"
+            parts = [str(x) for x in col if x not in (None, "", " ")]
+            name = "_".join(parts) if parts else "col"
+            flat_cols.append(name)
+        df.columns = flat_cols
+
+    # 2) Mappa nomi a canonicali
+    rename_map = {}
+    for c in df.columns:
+        lc = c.lower().strip()
+        if lc == "open" or lc.endswith("_open"):
+            rename_map[c] = "Open"
+        elif lc == "high" or lc.endswith("_high"):
+            rename_map[c] = "High"
+        elif lc == "low" or lc.endswith("_low"):
+            rename_map[c] = "Low"
+        elif lc == "close" or lc.endswith("_close"):
+            rename_map[c] = "Close"
+        elif lc in ("adj close", "adj_close") or lc.endswith("_adj close") or lc.endswith("_adj_close"):
+            rename_map[c] = "Adj Close"
+        elif lc == "volume" or lc.endswith("_volume"):
+            rename_map[c] = "Volume"
+
+    df = df.rename(columns=rename_map)
+
+    # 3) Fallback: se non c'è Close ma c'è Adj Close → usa Adj Close
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df["Close"] = df["Adj Close"]
+
     return df
 
-@st.cache_data(ttl=300)
-def fetch_fast_info(ticker):
-    t = yf.Ticker(ticker)
-    # fast_info è più snello e stabile per alcuni campi
-    fi = getattr(t, "fast_info", {}) or {}
-    # fallback a info solo per campi mancanti
-    info = {}
+def safe_ticker_info(t):
+    """Restituisce un dict info sempre valido (anche se yfinance fallisce)."""
     try:
-        info = t.info or {}
+        d = t.info
+        return d if isinstance(d, dict) else {}
     except Exception:
-        info = {}
-    return fi, info
+        return {}
 
-def get_close_and_prev_from_grouped(df, t):
-    """Estrae last close e prev close da df group_by='ticker' robustamente."""
-    if isinstance(df.columns, pd.MultiIndex):
-        # Struttura: livello1=ticker, livello2=campo (Open/High/Low/Close/...)
-        if t in df.columns.get_level_values(0):
-            sub = df[t]
-            if "Close" in sub.columns:
-                closes = sub["Close"].dropna()
-                if len(closes) >= 2:
-                    return closes.iloc[-1], closes.iloc[-2]
-                elif len(closes) == 1:
-                    return closes.iloc[-1], np.nan
-    else:
-        # Caso singolo ticker (non usato qui, ma utile)
-        closes = df["Close"].dropna()
-        if len(closes) >= 2:
-            return closes.iloc[-1], closes.iloc[-2]
-        elif len(closes) == 1:
-            return closes.iloc[-1], np.nan
-    return np.nan, np.nan
+# =========================
+# INPUT
+# =========================
+col1, col2, col3 = st.columns([1,1,2])
+with col1:
+    tickers = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX","BBVA"]
+with col2:
+    ticker = st.selectbox("Seleziona un Titolo", tickers)
+with col3:
+    period = st.selectbox("Periodo", ["3mo","6mo","1y"])
 
-def compute_atr(df, period=14):
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr
-
-# ============ HEATMAP ============
+# =========================
+# 🗺️ HEATMAP MERCATO
+# =========================
 st.subheader("🗺️ Market Heatmap (Daily)")
 
-heatmap_rows = []
-with st.spinner("Caricamento dati mercato..."):
+heatmap_data = []
+for t in tickers:
     try:
-        df_all = fetch_prices_for_heatmap(TICKERS)
-        for t in TICKERS:
-            last_c, prev_c = get_close_and_prev_from_grouped(df_all, t)
-            if pd.notna(last_c) and pd.notna(prev_c) and prev_c != 0:
-                change = (last_c - prev_c) / prev_c
-            else:
-                change = np.nan
+        stock = yf.Ticker(t)
+        info = safe_ticker_info(stock)
 
-            # MarketCap: usa fast_info; se mancante, fallback a info
-            fi, info = fetch_fast_info(t)
-            mcap = fi.get("market_cap")
-            if mcap is None:
-                mcap = info.get("marketCap", 1)
-            sector = info.get("sector") or "Other"
+        price = info.get("currentPrice", None)
+        prev = info.get("previousClose", None)
+        market_cap = info.get("marketCap", 1)
+        sector = info.get("sector", "Other")
 
-            if pd.notna(change):
-                heatmap_rows.append({
-                    "Sector": sector,
-                    "Ticker": t,
-                    "Change": change,
-                    "MarketCap": float(mcap) if mcap else 1.0
-                })
+        if isinstance(price, (int, float)) and isinstance(prev, (int, float)) and prev not in (0, None):
+            change = (price - prev) / prev
+            heatmap_data.append({
+                "Sector": sector or "Other",
+                "Ticker": t,
+                "Change": change,
+                "MarketCap": float(market_cap) if market_cap else 1.0
+            })
     except Exception as e:
-        st.warning(f"Impossibile costruire heatmap: {e}")
+        st.warning(f"Heatmap: impossibile processare {t}: {e}")
 
-df_heat = pd.DataFrame(heatmap_rows)
+df_heat = pd.DataFrame(heatmap_data)
 
 if not df_heat.empty:
     fig_heat = px.treemap(
@@ -118,165 +120,166 @@ if not df_heat.empty:
         color_continuous_scale=["red","black","green"],
         color_continuous_midpoint=0
     )
-    fig_heat.update_layout(template="plotly_dark", margin=dict(t=30,l=10,r=10,b=10))
+    fig_heat.update_layout(
+        template="plotly_dark",
+        margin=dict(t=30, l=10, r=10, b=10)
+    )
     st.plotly_chart(fig_heat, use_container_width=True)
 else:
     st.info("Nessun dato disponibile per la heatmap.")
 
 st.markdown("---")
 
-# ============ ANALISI ============
+# =========================
+# ANALISI DETTAGLIO
+# =========================
 if st.button("Analizza"):
-    with st.spinner("Analisi in corso..."):
-        # Scarico storico singolo ticker per periodo richiesto (+ buffer)
-        data = yf.download(ticker, period=period, progress=False, auto_adjust=False)
-        if data is None or data.empty:
-            st.error("Errore nel recupero dati")
+    # Scarica storico (usa auto_adjust=False per mantenere Close + Adj Close distinti)
+    data = yf.download(ticker, period=period, progress=False, auto_adjust=False)
+
+    if data is None or data.empty:
+        st.error("Errore nel recupero dati")
+    else:
+        # Normalizza colonne per evitare KeyError: 'Close'
+        data = normalize_ohlcv(data)
+
+        # Debug utile se qualcosa va storto
+        if "Close" not in data.columns:
+            st.error("La colonna 'Close' non è presente nei dati scaricati.")
+            st.write("Colonne disponibili:", list(data.columns))
+            st.stop()
+
+        # Guardrail: servono almeno 20 barre
+        if data.shape[0] < 20:
+            st.warning("Storico troppo corto per calcolare indicatori a 20 periodi con affidabilità.")
+
+        # ===== TECNICO =====
+        close = data["Close"].astype(float)
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+
+        upper = ma20 + 2 * std20
+        lower = ma20 - 2 * std20
+
+        last_price = float(close.iloc[-1])
+        last_std = float(std20.iloc[-1]) if pd.notna(std20.iloc[-1]) else np.nan
+        last_ma20 = float(ma20.iloc[-1]) if pd.notna(ma20.iloc[-1]) else np.nan
+        last_upper = float(upper.iloc[-1]) if pd.notna(upper.iloc[-1]) else np.nan
+        last_lower = float(lower.iloc[-1]) if pd.notna(lower.iloc[-1]) else np.nan
+
+        if pd.notna(last_lower) and last_price < last_lower:
+            tech_signal = "BUY"
+        elif pd.notna(last_upper) and last_price > last_upper:
+            tech_signal = "SELL"
         else:
-            # Normalizza colonne (evita droplevel che può crashare)
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = ["_".join(col).strip() if isinstance(col, tuple) else col
-                                for col in data.columns.values]
-                # Prova a ricostruire le canoniche
-                rename_map = {}
-                for c in data.columns:
-                    if c.endswith("_Close"): rename_map[c] = "Close"
-                    if c.endswith("_Open"):  rename_map[c] = "Open"
-                    if c.endswith("_High"):  rename_map[c] = "High"
-                    if c.endswith("_Low"):   rename_map[c] = "Low"
-                    if c.endswith("_Volume"):rename_map[c] = "Volume"
-                data = data.rename(columns=rename_map)
+            tech_signal = "HOLD"
 
-            # Guardrail per lunghezza
-            if data.shape[0] < 25:
-                st.warning("Storico troppo corto per calcolare indicatori a 20 periodi con affidabilità.")
-            
-            # ===== TECNICO (Bollinger + ATR) =====
-            data = data.sort_index()
-            data["MA20"] = data["Close"].rolling(20).mean()
-            std20 = data["Close"].rolling(20).std()
-            data["Upper"] = data["MA20"] + 2 * std20
-            data["Lower"] = data["MA20"] - 2 * std20
+        # ===== FONDAMENTALE =====
+        ticker_obj = yf.Ticker(ticker)
+        info = safe_ticker_info(ticker_obj)
 
-            data["ATR14"] = compute_atr(data, 14)
+        eps_qoq = info.get("earningsQuarterlyGrowth", None)
+        eps_ttm = info.get("earningsGrowth", None)
+        market_cap = info.get("marketCap", None)
+        pe_ratio = info.get("trailingPE", None)
 
-            last_price = float(data["Close"].iloc[-1])
-            ma20 = float(data["MA20"].iloc[-1]) if pd.notna(data["MA20"].iloc[-1]) else np.nan
-            upper = float(data["Upper"].iloc[-1]) if pd.notna(data["Upper"].iloc[-1]) else np.nan
-            lower = float(data["Lower"].iloc[-1]) if pd.notna(data["Lower"].iloc[-1]) else np.nan
-            atr14 = float(data["ATR14"].iloc[-1]) if pd.notna(data["ATR14"].iloc[-1]) else np.nan
-
-            if pd.notna(lower) and last_price < lower:
-                tech_signal = "BUY"
-            elif pd.notna(upper) and last_price > upper:
-                tech_signal = "SELL"
+        # Market Cap
+        if market_cap:
+            if market_cap > 10_000_000_000:
+                cap_type = "Large Cap"
+            elif market_cap > 2_000_000_000:
+                cap_type = "Mid Cap"
             else:
-                tech_signal = "HOLD"
-
-            # ===== FONDAMENTALE (robust fallback) =====
-            fi, info = fetch_fast_info(ticker)
-            pe = info.get("trailingPE") or info.get("forwardPE") or fi.get("trailing_pe") or None
-            eps_qoq = info.get("earningsQuarterlyGrowth")
-            eps_ttm = info.get("earningsGrowth")  # può essere None/sporco
-            market_cap = (fi.get("market_cap")
-                          or info.get("marketCap"))
-            # classificazione cap
+                cap_type = "Small Cap"
+        else:
             cap_type = "N/A"
+
+        # P/E
+        if isinstance(pe_ratio, (int, float)):
+            if pe_ratio < 25:
+                pe_status = "OK"
+            elif pe_ratio < 40:
+                pe_status = "MEDIUM"
+            else:
+                pe_status = "HIGH"
+        else:
+            pe_status = "N/A"
+
+        # Fondamentali OK
+        fundamental_ok = False
+        if isinstance(eps_qoq, (int, float)) and isinstance(eps_ttm, (int, float)) and isinstance(pe_ratio, (int, float)):
+            if eps_qoq > 0.10 and eps_ttm > 0.10 and pe_ratio < 25:
+                fundamental_ok = True
+
+        # ===== SEGNALE FINALE =====
+        if tech_signal == "BUY" and fundamental_ok:
+            final_signal = "BUY STRONG ⭐" if cap_type == "Large Cap" else "BUY STRONG"
+        elif tech_signal == "BUY" and pe_status == "HIGH":
+            final_signal = "BUY (overvalued)"
+        elif tech_signal == "BUY":
+            final_signal = "BUY (weak)"
+        elif tech_signal == "SELL":
+            final_signal = "SELL"
+        else:
+            final_signal = "HOLD"
+
+        # ===== RISK MANAGEMENT DINAMICO =====
+        stop_loss = last_price - (1.5 * last_std) if pd.notna(last_std) and last_std > 0 else np.nan
+        take_profit_1 = last_ma20
+        take_profit_2 = last_upper
+
+        # ===== TABS =====
+        tab1, tab2, tab3 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio"])
+
+        # TECNICA
+        with tab1:
+            st.subheader("Analisi Tecnica")
+            st.write(f"Segnale: **{tech_signal}**")
+
+            fig, ax = plt.subplots()
+            ax.plot(close.index, close.values, label="Prezzo")
+            if ma20.notna().any():
+                ax.plot(ma20.index, ma20.values, label="MA20")
+            if upper.notna().any():
+                ax.plot(upper.index, upper.values, linestyle="--", label="Banda alta")
+            if lower.notna().any():
+                ax.plot(lower.index, lower.values, linestyle="--", label="Banda bassa")
+            ax.legend()
+            st.pyplot(fig)
+
+        # FONDAMENTALE
+        with tab2:
+            st.subheader("Analisi Fondamentale")
+            st.write(f"EPS QoQ: {eps_qoq:.2%}" if isinstance(eps_qoq, (int,float)) else "EPS QoQ: N/A")
+            st.write(f"EPS TTM: {eps_ttm:.2%}" if isinstance(eps_ttm, (int,float)) else "EPS TTM: N/A")
             if market_cap:
-                if market_cap > 10_000_000_000: cap_type = "Large Cap"
-                elif market_cap > 2_000_000_000: cap_type = "Mid Cap"
-                else: cap_type = "Small Cap"
+                st.write(f"Market Cap: ${market_cap:,.0f} ({cap_type})")
+            st.write(f"P/E: {pe_ratio:.2f} ({pe_status})" if isinstance(pe_ratio, (int,float)) else f"P/E: N/A ({pe_status})")
 
-            # P/E status
-            if pe is None:
-                pe_status = "N/A"
+        # CONSIGLIO
+        with tab3:
+            st.subheader("🎯 Consiglio Finale")
+            if final_signal == "BUY STRONG ⭐":
+                st.success("🔥 BUY STRONG ⭐")
+            elif final_signal == "BUY STRONG":
+                st.success("🔥 BUY STRONG")
+            elif "BUY" in final_signal:
+                st.info(final_signal)
+            elif final_signal == "SELL":
+                st.error("📉 SELL")
             else:
-                pe_status = "OK" if pe < 25 else ("MEDIUM" if pe < 40 else "HIGH")
+                st.warning("⚖️ HOLD")
 
-            # scoring fondamentale leggermente più morbido
-            fundamental_score = 0
-            if isinstance(eps_qoq, (int, float)) and eps_qoq > 0.05: fundamental_score += 1
-            if isinstance(eps_ttm, (int, float)) and eps_ttm > 0.05: fundamental_score += 1
-            if isinstance(pe, (int, float)) and pe < 25: fundamental_score += 1
+            # LIVELLI DINAMICI
+            if "BUY" in final_signal:
+                st.subheader("🎯 Livelli operativi (dinamici)")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.error("🛑 Stop Loss")
+                    st.write(f"{stop_loss:.2f}" if isinstance(stop_loss, (int,float)) and not np.isnan(stop_loss) else "N/A")
+                with c2:
+                    st.success("🎯 Take Profit")
+                    st.write(f"Target 1 (media): {take_profit_1:.2f}" if isinstance(take_profit_1, (int,float)) and not np.isnan(take_profit_1) else "N/A")
+                    st.write(f"Target 2 (banda alta): {take_profit_2:.2f}" if isinstance(take_profit_2, (int,float)) and not np.isnan(take_profit_2) else "N/A")
 
-            fundamental_ok = fundamental_score >= 2  # soglia morbida
-
-            # ===== SEGNALE FINALE =====
-            if tech_signal == "BUY" and fundamental_ok:
-                final_signal = "BUY STRONG ⭐" if cap_type == "Large Cap" else "BUY STRONG"
-            elif tech_signal == "BUY" and pe_status == "HIGH":
-                final_signal = "BUY (overvalued)"
-            elif tech_signal == "BUY":
-                final_signal = "BUY (weak)"
-            elif tech_signal == "SELL":
-                final_signal = "SELL"
-            else:
-                final_signal = "HOLD"
-
-            # ===== RISK MANAGEMENT (ATR-based) =====
-            if pd.notna(atr14) and atr14 > 0:
-                stop_loss = last_price - 1.5 * atr14
-                tp1 = last_price + 1.0 * atr14
-                tp2 = last_price + 2.0 * atr14
-            else:
-                # fallback su std20
-                stop_loss = last_price - (1.5 * std20.iloc[-1] if pd.notna(std20.iloc[-1]) else 0.0)
-                tp1 = ma20 if pd.notna(ma20) else np.nan
-                tp2 = upper if pd.notna(upper) else np.nan
-
-            # ===== TABS =====
-            tab1, tab2, tab3 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio"])
-
-            with tab1:
-                st.subheader("Analisi Tecnica")
-                st.write(f"Segnale: **{tech_signal}**")
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Prezzo", mode="lines"))
-                if data["MA20"].notna().any():
-                    fig.add_trace(go.Scatter(x=data.index, y=data["MA20"], name="MA20", mode="lines"))
-                if data["Upper"].notna().any():
-                    fig.add_trace(go.Scatter(x=data.index, y=data["Upper"], name="Banda Alta", mode="lines", line=dict(dash="dash")))
-                if data["Lower"].notna().any():
-                    fig.add_trace(go.Scatter(x=data.index, y=data["Lower"], name="Banda Bassa", mode="lines", line=dict(dash="dash")))
-                fig.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10))
-                st.plotly_chart(fig, use_container_width=True)
-
-            with tab2:
-                st.subheader("Analisi Fondamentale")
-                def fmt_pct(x): 
-                    return f"{x:.2%}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
-                def fmt_num(x): 
-                    return f"${x:,.0f}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
-                def fmt_pe(x): 
-                    return f"{x:.2f}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
-
-                st.write(f"EPS QoQ: {fmt_pct(eps_qoq)}")
-                st.write(f"EPS TTM: {fmt_pct(eps_ttm)}")
-                st.write(f"Market Cap: {fmt_num(market_cap)} ({cap_type})")
-                st.write(f"P/E: {fmt_pe(pe)} ({pe_status})")
-
-            with tab3:
-                st.subheader("🎯 Consiglio Finale")
-                if final_signal == "BUY STRONG ⭐":
-                    st.success("🔥 BUY STRONG ⭐")
-                elif final_signal == "BUY STRONG":
-                    st.success("🔥 BUY STRONG")
-                elif "BUY" in final_signal:
-                    st.info(final_signal)
-                elif final_signal == "SELL":
-                    st.error("📉 SELL")
-                else:
-                    st.warning("⚖️ HOLD")
-
-                if "BUY" in final_signal or final_signal == "HOLD":
-                    st.subheader("🎯 Livelli operativi (dinamici)")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.error("🛑 Stop Loss")
-                        st.write(f"{stop_loss:.2f}" if pd.notna(stop_loss) else "N/A")
-                    with c2:
-                        st.success("🎯 Take Profit")
-                        st.write(f"Target 1: {tp1:.2f}" if pd.notna(tp1) else "N/A")
-                        st.write(f"Target 2: {tp2:.2f}" if pd.notna(tp2) else "N/A")
-                st.caption("⚠️ Livelli indicativi, non consulenza finanziaria.")
+            st.caption("⚠️ Livelli indicativi, non consulenza finanziaria.")
