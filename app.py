@@ -12,13 +12,14 @@ st.write("Analisi tecnica + fondamentale + gestione del rischio")
 
 # ===== INPUT =====
 tickers = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX"]
-ticker = st.selectbox("Seleziona un ticker", tickers)
+ticker = st.selectbox("Seleziona un Titolo", tickers)
 period = st.selectbox("Periodo", ["3mo","6mo","1y"])
 
 # ===== ANALISI =====
 if st.button("Analizza"):
 
     data = yf.download(ticker, period=period)
+    data.columns = data.columns.droplevel(1)  # Flatten MultiIndex columns
 
     if data.empty:
         st.error("Errore nel recupero dati")
