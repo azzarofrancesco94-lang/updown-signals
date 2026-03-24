@@ -1,7 +1,6 @@
-# Write the generated Streamlit app with advanced watchlist to app.py
-app_code = r'''# app.py
+# app.py
 import re
-import io
+import requests
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -397,10 +396,9 @@ PRESET_LISTS = {
 def load_sp500_from_wikipedia() -> list:
     """Prova a caricare la lista S&P500 da Wikipedia. Se fallisce, ritorna []."""
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        url = "https://wikipedia.org/wiki/List_of_S%26P_500_companies"
         df = pd.read_html(url)[0]
         syms = df["Symbol"].astype(str).str.strip().tolist()
-        # Alcuni simboli hanno "." come separatore su Yahoo -> converti a '-'
         syms = [s.replace(".", "-") for s in syms]
         return syms
     except Exception:
@@ -409,21 +407,45 @@ def load_sp500_from_wikipedia() -> list:
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_nasdaq100_from_wikipedia() -> list:
     try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        url = "https://wikipedia.org/wiki/Nasdaq-100"
         tables = pd.read_html(url)
-        # In genere la 1a o 2a tabella contiene i componenti
         for df in tables:
             if "Ticker" in df.columns or "Symbol" in df.columns:
                 col = "Ticker" if "Ticker" in df.columns else "Symbol"
                 syms = df[col].astype(str).str.strip().tolist()
                 syms = [s.replace(".", "-") for s in syms]
-                # Filtro simboli strani
-                syms = [s for s in syms if len(s) > 0 and len(s) <= 10]
+                syms = [s for s in syms if 0 < len(s) <= 10]
                 if len(syms) >= 50:
                     return syms
         return []
     except Exception:
         return []
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def yahoo_search_quotes(query: str, count: int = 30) -> pd.DataFrame:
+    """Usa l'endpoint di Yahoo Finance search per risolvere ISIN/nome in simboli.
+    Ritorna un DataFrame con colonne: Symbol, Name, Exchange, Type.
+    """
+    try:
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        params = {"q": query, "quotesCount": int(count), "newsCount": 0, "lang": "en-US"}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        js = r.json() or {}
+        quotes = js.get("quotes", [])
+        rows = []
+        for q in quotes:
+            rows.append({
+                "Symbol": q.get("symbol"),
+                "Name": q.get("shortname") or q.get("longname") or q.get("name"),
+                "Exchange": q.get("exchDisp"),
+                "Type": q.get("typeDisp")
+            })
+        df = pd.DataFrame(rows)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def normalize_ticker_list(raw_list: list[str]) -> list[str]:
     seen = set()
@@ -432,7 +454,6 @@ def normalize_ticker_list(raw_list: list[str]) -> list[str]:
         t2 = t.strip().upper()
         if not t2:
             continue
-        # Consenti lettere, numeri, trattino, punto
         if re.fullmatch(r"[A-Z0-9\-\.]+", t2) is None:
             continue
         if t2 not in seen:
@@ -474,7 +495,7 @@ def get_history_normalized(ticker: str, period: str) -> pd.DataFrame:
     return normalize_ohlcv(raw)
 
 # =========================
-# LAYOUT: HEATMAP + CONTROLLI AFFIANCATI (con Watchlist avanzata)
+# LAYOUT: HEATMAP + CONTROLLI AFFIANCATI (con Watchlist avanzata + ricerca ISIN)
 # =========================
 left, right = st.columns([3, 1], gap="large")
 
@@ -505,6 +526,32 @@ with right:
         
     apply_watch = st.button("📥 Applica watchlist")
 
+    # Ricerca per ISIN / Nome
+    with st.expander("Ricerca per ISIN / Nome", expanded=False):
+        isin_query = st.text_input("Inserisci ISIN o nome società", "",
+                                   placeholder="ES: US0378331005 oppure Apple")
+        cols_isin = st.columns([1,1,1])
+        with cols_isin[0]:
+            do_search = st.button("🔎 Cerca")
+        with cols_isin[1]:
+            add_selected = st.button("➕ Aggiungi selezionato")
+        with cols_isin[2]:
+            clear_results = st.button("🧹 Pulisci")
+
+        if do_search and isin_query.strip():
+            st.session_state["isin_results"] = yahoo_search_quotes(isin_query.strip(), count=50)
+        if clear_results:
+            st.session_state["isin_results"] = pd.DataFrame()
+        results = st.session_state.get("isin_results", pd.DataFrame())
+        if isinstance(results, pd.DataFrame) and not results.empty:
+            st.dataframe(results.head(30))
+            sel = st.selectbox("Seleziona simbolo da aggiungere", results["Symbol"].tolist())
+            if add_selected and sel:
+                st.session_state["watchlist"] = normalize_ticker_list(st.session_state["watchlist"] + [sel])
+                st.success(f"Aggiunto {sel} alla watchlist")
+        else:
+            st.caption("Nessun risultato ancora. Usa la ricerca sopra.")
+
     # Costruzione watchlist
     final_list = []
     if preset in PRESET_LISTS:
@@ -514,31 +561,26 @@ with right:
     elif preset == "Nasdaq-100 (Wikipedia)":
         final_list.extend(load_nasdaq100_from_wikipedia())
 
-    # Aggiungi custom da textarea
     if custom_area:
         user_list = [x.strip() for x in custom_area.split(",")]
         final_list.extend(user_list)
 
-    # File CSV
     if uploaded is not None:
         try:
             df_up = pd.read_csv(uploaded)
             if "Symbol" in df_up.columns:
                 final_list.extend(df_up["Symbol"].astype(str).tolist())
             else:
-                # usa la prima colonna
                 first_col = df_up.columns[0]
                 final_list.extend(df_up[first_col].astype(str).tolist())
         except Exception as e:
             st.warning(f"CSV non letto: {e}")
 
-    # Extra inclusioni rapide
     if include_etf:
         final_list.extend(["SPY","QQQ","IWM","DIA","XLK","XLF","XLE","XLI","XLV","XLY","XLP","XLB","XLU"])
     if include_crypto:
         final_list.extend(["BTC-USD","ETH-USD"]) 
 
-    # Normalizza e limita per heatmap
     final_list = normalize_ticker_list(final_list)
     if len(final_list) == 0:
         final_list = DEFAULT_WATCHLIST
@@ -547,7 +589,6 @@ with right:
         st.session_state["watchlist"] = final_list
         st.success(f"Watchlist aggiornata: {len(final_list)} simboli")
 
-    # Select box del titolo
     ticker = st.selectbox("Seleziona un Titolo", st.session_state["watchlist"], index=0)
     period = st.selectbox("Periodo", ["3mo","6mo","1y"], index=0)
 
@@ -595,14 +636,11 @@ weights_norm = {k: (v / (w_sum if w_sum > 0 else 1.0)) for k, v in weights_raw.i
 
 with left:
     st.subheader("🗺️ Market Heatmap (Daily)")
-    # Limita la heatmap ai primi N per market cap (quando disponibile)
     wl = st.session_state["watchlist"]
     df_heat = build_heatmap_df(wl)
 
     if not df_heat.empty:
-        # Ordina per market cap e limita
         df_heat = df_heat.sort_values("MarketCap", ascending=False).head(heat_max)
-        # Percentuale formattata con segno
         df_heat = df_heat.copy()
         df_heat["ChangePctStr"] = df_heat["Change"].apply(
             lambda x: f"+{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) and x >= 0
@@ -618,7 +656,6 @@ with left:
             color_continuous_midpoint=0,
             custom_data=["ChangePctStr"]
         )
-        # Testo centrale: ticker (bold) + % sotto
         fig_heat.data[0].texttemplate = "<b>%{label}</b><br>%{customdata[0]}"
         fig_heat.data[0].textposition = "middle center"
         fig_heat.update_traces(textfont=dict(size=16))
@@ -714,10 +751,8 @@ if run_analysis or "last_signal" not in st.session_state:
     series = fund["series"]
     criteria = fund["criteria"]
 
-    # Score pesato (0..100) + band + motivazioni + contributi per categoria
     fscore100, fband, freasons, fcontrib = compute_weighted_score(criteria, weights_norm)
 
-    # Classificazioni base per final_signal (cap_type / pe_status)
     t_obj = yf.Ticker(ticker)
     info_basic = safe_ticker_info(t_obj)
     market_cap = safe_get(info_basic, "marketCap")
@@ -743,10 +778,8 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         pe_status = "N/A"
 
-    # Usa lo score pesato per la validazione fondamentale
     fundamental_ok = fscore100 >= 60.0
 
-    # ===== SEGNALE FINALE =====
     if tech_signal == "BUY" and fundamental_ok:
         final_signal = "BUY STRONG ⭐" if cap_type == "Large Cap" else "BUY STRONG"
     elif tech_signal == "BUY" and pe_status == "HIGH":
@@ -759,7 +792,7 @@ if run_analysis or "last_signal" not in st.session_state:
         final_signal = "HOLD"
 
     # =========================
-    # SEGNALE STORICO (serie BUY/SELL/HOLD) per grafico e backtest
+    # SEGNALE STORICO (serie BUY/SELL/HOLD)
     # =========================
     df = data.copy()
     cond_up = (df["EMA_fast"] > df["EMA_slow"]) & (df["Close"] > df["KC_mid"]) \
@@ -769,13 +802,11 @@ if run_analysis or "last_signal" not in st.session_state:
 
     df["Signal"] = np.where(cond_up, "BUY", np.where(cond_down, "SELL", "HOLD"))
     df["Position"] = df["Signal"].replace({"BUY":1, "SELL":-1, "HOLD":0}).shift(1).fillna(0)
-    df["CrossUp"] = (df["EMA_fast"] > df["EMA_slow"]) & (df["EMA_fast"].shift(1) <= df["EMA_slow"].shift(1))
-    df["CrossDown"] = (df["EMA_fast"] < df["EMA_slow"]) & (df["EMA_fast"].shift(1) >= df["EMA_slow"].shift(1))
 
     # ===== TABS =====
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio", "📚 Backtest"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio", "📚 Backtest", "📈 Rendimento"])
 
-    # TECNICA — grafico migliorato per leggere EMA_fast > EMA_slow + segnali
+    # TECNICA
     with tab1:
         st.subheader("Analisi Tecnica (Trend + EMA spread)")
         st.write(
@@ -786,92 +817,53 @@ if run_analysis or "last_signal" not in st.session_state:
         )
 
         fast = data["EMA_fast"]; slow = data["EMA_slow"]
-        spread = fast - slow
-
         fig = go.Figure()
-        # Prezzo
-        fig.add_trace(go.Scatter(
-            x=data.index, y=data["Close"], name="Prezzo", mode="lines",
-            line=dict(color="#cfcfcf", width=1.5)
-        ))
-        # EMA slow (rossa, tratteggiata)
-        fig.add_trace(go.Scatter(
-            x=data.index, y=slow, name=f"EMA{int(ema_slow)} (slow)",
-            mode="lines", line=dict(color="#FF6347", width=2, dash="dash")
-        ))
-        # EMA fast (oro)
-        fig.add_trace(go.Scatter(
-            x=data.index, y=fast, name=f"EMA{int(ema_fast)} (fast)",
-            mode="lines", line=dict(color="#FFD700", width=2.5)
-        ))
-
-        # Fill verde dove fast>slow
-        y_upper = np.where(fast > slow, fast, slow)
-        y_lower = np.where(fast > slow, slow, fast)
-        fig.add_trace(go.Scatter(x=data.index, y=y_upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=data.index, y=y_lower, line=dict(width=0), showlegend=False, hoverinfo="skip",
-            fill="tonexty", fillcolor="rgba(0, 170, 0, 0.10)", name="Zona fast>slow"
-        ))
-        # Fill rosso dove fast<slow
-        y_upper_r = np.where(fast < slow, slow, np.nan)
-        y_lower_r = np.where(fast < slow, fast, np.nan)
-        fig.add_trace(go.Scatter(x=data.index, y=y_upper_r, line=dict(width=0), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(
-            x=data.index, y=y_lower_r, line=dict(width=0), showlegend=False, hoverinfo="skip",
-            fill="tonexty", fillcolor="rgba(200, 0, 0, 0.10)", name="Zona fast<slow"
-        ))
-
-        # Marker segnali operativi
+        fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Prezzo", mode="lines",
+                                 line=dict(color="#cfcfcf", width=1.5)))
+        fig.add_trace(go.Scatter(x=data.index, y=slow, name=f"EMA{int(ema_slow)} (slow)",
+                                 mode="lines", line=dict(color="#FF6347", width=2, dash="dash")))
+        fig.add_trace(go.Scatter(x=data.index, y=fast, name=f"EMA{int(ema_fast)} (fast)",
+                                 mode="lines", line=dict(color="#FFD700", width=2.5)))
+        y_up = np.where(fast > slow, fast, slow)
+        y_lo = np.where(fast > slow, slow, fast)
+        fig.add_trace(go.Scatter(x=data.index, y=y_up, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=data.index, y=y_lo, line=dict(width=0), showlegend=False, hoverinfo="skip",
+                                 fill="tonexty", fillcolor="rgba(0, 170, 0, 0.10)", name="Zona fast>slow"))
+        y_up_r = np.where(fast < slow, slow, np.nan)
+        y_lo_r = np.where(fast < slow, fast, np.nan)
+        fig.add_trace(go.Scatter(x=data.index, y=y_up_r, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=data.index, y=y_lo_r, line=dict(width=0), showlegend=False, hoverinfo="skip",
+                                 fill="tonexty", fillcolor="rgba(200, 0, 0, 0.10)", name="Zona fast<slow"))
         sig_buy_points = df[df["Signal"] == "BUY"]
         sig_sell_points = df[df["Signal"] == "SELL"]
         if not sig_buy_points.empty:
-            fig.add_trace(go.Scatter(
-                x=sig_buy_points.index, y=sig_buy_points["Close"],
-                name="Signal BUY", mode="markers",
-                marker=dict(color="#00c853", size=9, symbol="circle"),
-                hovertemplate="BUY %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"
-            ))
+            fig.add_trace(go.Scatter(x=sig_buy_points.index, y=sig_buy_points["Close"], name="Signal BUY",
+                                     mode="markers", marker=dict(color="#00c853", size=9, symbol="circle"),
+                                     hovertemplate="BUY %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"))
         if not sig_sell_points.empty:
-            fig.add_trace(go.Scatter(
-                x=sig_sell_points.index, y=sig_sell_points["Close"],
-                name="Signal SELL", mode="markers",
-                marker=dict(color="#d50000", size=9, symbol="x"),
-                hovertemplate="SELL %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"
-            ))
-
-        fig.update_layout(
-            template="plotly_dark", height=460,
-            margin=dict(t=20, l=10, r=10, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-        )
+            fig.add_trace(go.Scatter(x=sig_sell_points.index, y=sig_sell_points["Close"], name="Signal SELL",
+                                     mode="markers", marker=dict(color="#d50000", size=9, symbol="x"),
+                                     hovertemplate="SELL %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"))
+        fig.update_layout(template="plotly_dark", height=460, margin=dict(t=20,l=10,r=10,b=10),
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Elenco segnali + download
         with st.expander("🧾 Elenco segnali (storico) + download"):
             sig_df = df.loc[(df["Signal"].shift(1) != df["Signal"]) | (df.index == df.index[0])].copy()
             sig_df = sig_df[["Signal", "Close", "EMA_fast", "EMA_slow", "MACD", "MACD_signal", "RSI14"]]
-            sig_df = sig_df.rename(columns={
-                "Close":"Prezzo", "EMA_fast":f"EMA{int(ema_fast)}", "EMA_slow":f"EMA{int(ema_slow)}"
-            })
+            sig_df = sig_df.rename(columns={"Close":"Prezzo", "EMA_fast":f"EMA{int(ema_fast)}", "EMA_slow":f"EMA{int(ema_slow)}"})
             st.dataframe(sig_df.tail(30))
             csv = sig_df.to_csv(index=True).encode("utf-8")
-            st.download_button(
-                label="⬇️ Scarica segnali (CSV)",
-                data=csv,
-                file_name=f"signals_{ticker}_{period}.csv",
-                mime="text/csv"
-            )
+            st.download_button(label="⬇️ Scarica segnali (CSV)", data=csv,
+                               file_name=f"signals_{ticker}_{period}.csv", mime="text/csv")
 
-    # FONDAMENTALE (pesi custom)
+    # FONDAMENTALE
     with tab2:
         st.subheader("Analisi Fondamentale (pesi personalizzati)")
-
-        # Score complessivo
+        fscore100, fband, freasons, fcontrib = compute_weighted_score(criteria, weights_norm)
         color = "#3CB371" if fband == "Strong" else ("#F0AD4E" if fband == "Neutral" else "#D9534F")
         st.markdown(
-            f"**Fundamental Score:** "
-            f"<span style='color:{color}; font-size:20px'><b>{fscore100:.1f}/100 – {fband}</b></span>",
+            f"**Fundamental Score:** <span style='color:{color}; font-size:20px'><b>{fscore100:.1f}/100 – {fband}</b></span>",
             unsafe_allow_html=True
         )
         with st.expander("Motivazioni (criteri rispettati)"):
@@ -880,8 +872,6 @@ if run_analysis or "last_signal" not in st.session_state:
                     st.write(f"• {r}")
             else:
                 st.write("Nessun criterio soddisfatto (dati incompleti o metriche deboli).")
-
-        # Snapshot KPI sintetico
         k1, k2, k3, k4, k5 = st.columns(5)
         with k1:
             st.caption("Valuation")
@@ -905,118 +895,38 @@ if run_analysis or "last_signal" not in st.session_state:
             st.caption("Dividendi")
             st.metric("Yield", fmt_pct(snapshot["Dividends"]["Dividend Yield"]))
             st.metric("Payout", fmt_pct(snapshot["Dividends"]["Payout Ratio"]))
-
         st.markdown("---")
-
-        # Contributo per categoria e pesi
-        contrib_df = pd.DataFrame({
-            "Categoria": list(fcontrib.keys()),
-            "Contributo (%)": [round(v, 2) for v in fcontrib.values()],
-            "Peso (%)": [round(weights_norm[k]*100.0, 2) for k in fcontrib.keys()]
-        })
+        contrib_df = pd.DataFrame({"Categoria": list(fcontrib.keys()),
+                                   "Contributo (%)": [round(v, 2) for v in fcontrib.values()],
+                                   "Peso (%)": [round(weights_norm[k]*100.0, 2) for k in fcontrib.keys()]})
         fig_contrib = go.Figure()
-        fig_contrib.add_trace(go.Bar(
-            x=contrib_df["Categoria"], y=contrib_df["Contributo (%)"],
-            name="Contributo allo score", marker_color="#6aa84f"
-        ))
-        fig_contrib.add_trace(go.Scatter(
-            x=contrib_df["Categoria"], y=contrib_df["Peso (%)"],
-            name="Peso assegnato", mode="lines+markers", line=dict(color="#888", dash="dot")
-        ))
-        fig_contrib.update_layout(template="plotly_dark", height=320, margin=dict(t=20,l=10,r=10,b=10),
-                                  yaxis_title="Percentuale")
+        fig_contrib.add_trace(go.Bar(x=contrib_df["Categoria"], y=contrib_df["Contributo (%)"], name="Contributo allo score", marker_color="#6aa84f"))
+        fig_contrib.add_trace(go.Scatter(x=contrib_df["Categoria"], y=contrib_df["Peso (%)"], name="Peso assegnato", mode="lines+markers", line=dict(color="#888", dash="dot")))
+        fig_contrib.update_layout(template="plotly_dark", height=320, margin=dict(t=20,l=10,r=10,b=10), yaxis_title="Percentuale")
         st.plotly_chart(fig_contrib, use_container_width=True)
-
         st.markdown("---")
-
-        # Tabelle dettagliate
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Valuation**")
             v = snapshot["Valuation"]
-            st.write({
-                "Trailing P/E": v["Trailing P/E"],
-                "Forward P/E": v["Forward P/E"],
-                "PEG": v["PEG"],
-                "P/S (TTM)": v["P/S (TTM)"],
-                "P/B": v["P/B"],
-                "EV/EBITDA": v["EV/EBITDA"],
-                "EV/Revenue": v["EV/Revenue"]
-            })
-
+            st.write({"Trailing P/E": v["Trailing P/E"], "Forward P/E": v["Forward P/E"], "PEG": v["PEG"],
+                      "P/S (TTM)": v["P/S (TTM)"], "P/B": v["P/B"], "EV/EBITDA": v["EV/EBITDA"], "EV/Revenue": v["EV/Revenue"]})
             st.markdown("**Profitability**")
             p = snapshot["Profitability"]
-            st.write({
-                "Gross Margin": fmt_pct(p["Gross Margin"]),
-                "Operating Margin": fmt_pct(p["Operating Margin"]),
-                "Net Margin": fmt_pct(p["Net Margin"]),
-                "ROE": fmt_pct(p["ROE"]),
-                "ROA": fmt_pct(p["ROA"])
-            })
-
+            st.write({"Gross Margin": fmt_pct(p["Gross Margin"]), "Operating Margin": fmt_pct(p["Operating Margin"]),
+                      "Net Margin": fmt_pct(p["Net Margin"]), "ROE": fmt_pct(p["ROE"]), "ROA": fmt_pct(p["ROA"])})
         with c2:
             st.markdown("**Growth**")
             g = snapshot["Growth"]
-            st.write({
-                "Revenue Growth (prov)": fmt_pct(g["Revenue Growth (prov)"]),
-                "EPS Growth QoQ": fmt_pct(g["EPS Growth QoQ"]),
-                "EPS Growth TTM": fmt_pct(g["EPS Growth TTM"]),
-                "Revenue CAGR (annuale)": fmt_pct(g["Revenue CAGR (annuale)"])
-            })
-
+            st.write({"Revenue Growth (prov)": fmt_pct(g["Revenue Growth (prov)"]), "EPS Growth QoQ": fmt_pct(g["EPS Growth QoQ"]),
+                      "EPS Growth TTM": fmt_pct(g["EPS Growth TTM"]), "Revenue CAGR (annuale)": fmt_pct(g["Revenue CAGR (annuale)"])})
             st.markdown("**Solidità & Dividendi**")
             s = snapshot["Solidity"]; d = snapshot["Dividends"]
-            st.write({
-                "Debt/Equity": s["Debt/Equity"] if isinstance(s["Debt/Equity"], (int,float)) else "N/A",
-                "Current Ratio": s["Current Ratio"] if isinstance(s["Current Ratio"], (int,float)) else "N/A",
-                "Quick Ratio": s["Quick Ratio"] if isinstance(s["Quick Ratio"], (int,float)) else "N/A",
-                "Total Debt": fmt_num(s["Total Debt"]),
-                "Total Cash": fmt_num(s["Total Cash"]),
-                "Dividend Yield": fmt_pct(d["Dividend Yield"]),
-                "Payout Ratio": fmt_pct(d["Payout Ratio"]),
-                "5Y Avg Yield": fmt_pct(d["5Y Avg Yield"])
-            })
-
-        st.markdown("---")
-
-        # Grafici di trend Ricavi / Utili
-        g1, g2 = st.columns(2)
-        with g1:
-            st.markdown("**Ricavi & Utile – Annuale**")
-            try:
-                df_earn = yf.Ticker(ticker).earnings
-                if isinstance(df_earn, pd.DataFrame) and not df_earn.empty:
-                    fig_a = go.Figure()
-                    if "Revenue" in df_earn.columns:
-                        fig_a.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Revenue"], name="Revenue"))
-                    if "Earnings" in df_earn.columns:
-                        fig_a.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Earnings"], name="Earnings"))
-                    fig_a.update_layout(template="plotly_dark", barmode="group", height=320,
-                                      margin=dict(t=10,l=10,r=10,b=10))
-                    st.plotly_chart(fig_a, use_container_width=True)
-                else:
-                    st.info("Dati annuali non disponibili.")
-            except Exception as e:
-                st.warning(f"Dati annuali non disponibili: {e}")
-
-        with g2:
-            st.markdown("**Ricavi & Utile – Trimestrale**")
-            try:
-                qearn = yf.Ticker(ticker).quarterly_earnings
-                if isinstance(qearn, pd.DataFrame) and not qearn.empty:
-                    figq = go.Figure()
-                    if "Revenue" in qearn.columns:
-                        figq.add_trace(go.Scatter(x=qearn.index.astype(str), y=qearn["Revenue"],
-                                                  name="Revenue", mode="lines+markers"))
-                    if "Earnings" in qearn.columns:
-                        figq.add_trace(go.Scatter(x=qearn.index.astype(str), y=qearn["Earnings"],
-                                                  name="Earnings", mode="lines+markers"))
-                    figq.update_layout(template="plotly_dark", height=320, margin=dict(t=10,l=10,r=10,b=10))
-                    st.plotly_chart(figq, use_container_width=True)
-                else:
-                    st.info("Dati trimestrali non disponibili.")
-            except Exception as e:
-                st.warning(f"Dati trimestrali non disponibili: {e}")
+            st.write({"Debt/Equity": s["Debt/Equity"] if isinstance(s["Debt/Equity"], (int,float)) else "N/A",
+                      "Current Ratio": s["Current Ratio"] if isinstance(s["Current Ratio"], (int,float)) else "N/A",
+                      "Quick Ratio": s["Quick Ratio"] if isinstance(s["Quick Ratio"], (int,float)) else "N/A",
+                      "Total Debt": fmt_num(s["Total Debt"]), "Total Cash": fmt_num(s["Total Cash"]),
+                      "Dividend Yield": fmt_pct(d["Dividend Yield"]), "Payout Ratio": fmt_pct(d["Payout Ratio"]), "5Y Avg Yield": fmt_pct(d["5Y Avg Yield"])})
 
     # CONSIGLIO
     with tab3:
@@ -1031,7 +941,6 @@ if run_analysis or "last_signal" not in st.session_state:
             st.error("📉 SELL")
         else:
             st.warning("⚖️ HOLD")
-
         if final_signal in ("BUY STRONG ⭐", "BUY STRONG", "BUY (overvalued)", "BUY (weak)"):
             st.subheader("🎯 Livelli operativi (dinamici)")
             c1, c2 = st.columns(2)
@@ -1048,34 +957,73 @@ if run_analysis or "last_signal" not in st.session_state:
     with tab4:
         st.subheader("📚 Backtest")
         metrics, bt = backtest_from_signals(df["Close"], df["Signal"], allow_short=allow_short, fee_bps=float(fee_bps))
-
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         kpi1.metric("CAGR", f"{metrics['cagr']*100:,.2f}%" if pd.notna(metrics['cagr']) else "N/A")
         kpi2.metric("Max Drawdown", f"{metrics['max_drawdown']*100:,.2f}%" if pd.notna(metrics['max_drawdown']) else "N/A")
         kpi3.metric("Sharpe", f"{metrics['sharpe']:.2f}" if pd.notna(metrics['sharpe']) else "N/A")
         kpi4.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
-
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(x=bt.index, y=bt["Equity"], name="Strategia", mode="lines"))
         fig_eq.add_trace(go.Scatter(x=bt.index, y=(bt["Close"] / bt["Close"].iloc[0]), name="Buy & Hold",
                                     mode="lines", line=dict(color="#888", dash="dot")))
-        fig_eq.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10),
-                             yaxis_title="Equity (base=1.0)")
+        fig_eq.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10), yaxis_title="Equity (base=1.0)")
         st.plotly_chart(fig_eq, use_container_width=True)
-
         fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(x=bt.index, y=bt["Drawdown"], name="Drawdown",
-                                    mode="lines", line=dict(color="#d9534f")))
-        fig_dd.update_layout(template="plotly_dark", height=240, margin=dict(t=20,l=10,r=10,b=10),
-                             yaxis_tickformat=".0%")
+        fig_dd.add_trace(go.Scatter(x=bt.index, y=bt["Drawdown"], name="Drawdown", mode="lines", line=dict(color="#d9534f")))
+        fig_dd.update_layout(template="plotly_dark", height=240, margin=dict(t=20,l=10,r=10,b=10), yaxis_tickformat=".0%")
         st.plotly_chart(fig_dd, use_container_width=True)
-
         with st.expander("Dettagli numerici"):
             st.dataframe(bt.tail(10))
             st.json(metrics)
-'''
 
-with open('app.py', 'w', encoding='utf-8') as f:
-    f.write(app_code)
+    # RENDIMENTO
+    with tab5:
+        st.subheader("📈 Grafico Rendimento (normalizzato)")
+        colp1, colp2 = st.columns([2,1])
+        with colp1:
+            bench = st.text_input("Benchmark (Ticker)", value="SPY", help="Ticker di confronto per il rendimento")
+        with colp2:
+            norm_base = st.selectbox("Base di normalizzazione", ["Inizio periodo", "Ultimi 6M", "Ultimi 3M"], index=0)
 
-print('app.py written successfully with advanced watchlist.')
+        base_idx = 0
+        if norm_base == "Ultimi 6M" and len(close) > 126:
+            base_idx = len(close) - 126
+        elif norm_base == "Ultimi 3M" and len(close) > 63:
+            base_idx = len(close) - 63
+
+        base_price = float(close.iloc[base_idx]) if len(close) > 0 else np.nan
+        cum_ticker = (close / base_price) if pd.notna(base_price) and base_price != 0 else pd.Series(index=close.index)
+
+        bdata = get_history_normalized(bench, period)
+        if not bdata.empty and "Close" in bdata.columns:
+            bclose = bdata["Close"].astype(float)
+            # allinea indici
+            bclose = bclose.reindex(close.index).ffill()
+            b_base = float(bclose.iloc[base_idx]) if len(bclose) > base_idx else np.nan
+            cum_bench = (bclose / b_base) if pd.notna(b_base) and b_base != 0 else None
+        else:
+            cum_bench = None
+
+        fig_perf = go.Figure()
+        fig_perf.add_trace(go.Scatter(x=cum_ticker.index, y=cum_ticker.values, name=f"{ticker} (norm)", mode="lines"))
+        if cum_bench is not None:
+            fig_perf.add_trace(go.Scatter(x=cum_bench.index, y=cum_bench.values, name=f"{bench} (norm)", mode="lines", line=dict(color="#888", dash="dot")))
+        fig_perf.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10), yaxis_title="Indice (base=1.0)")
+        st.plotly_chart(fig_perf, use_container_width=True)
+
+        st.markdown("**Riepilogo rendimenti**")
+        def period_ret(series, days):
+            if len(series) > days and series.iloc[-days] != 0:
+                return series.iloc[-1]/series.iloc[-days] - 1
+            return np.nan
+        k1, k2, k3, k4, k5 = st.columns(5)
+        r1d = close.pct_change().iloc[-1] if len(close) > 1 else np.nan
+        r1w = period_ret(close, 5)
+        r1m = period_ret(close, 21)
+        r3m = period_ret(close, 63)
+        r6m = period_ret(close, 126)
+        k1.metric("1D", f"{r1d*100:.2f}%" if pd.notna(r1d) else "N/A")
+        k2.metric("1W", f"{r1w*100:.2f}%" if pd.notna(r1w) else "N/A")
+        k3.metric("1M", f"{r1m*100:.2f}%" if pd.notna(r1m) else "N/A")
+        k4.metric("3M", f"{r3m*100:.2f}%" if pd.notna(r3m) else "N/A")
+        k5.metric("6M", f"{r6m*100:.2f}%" if pd.notna(r6m) else "N/A")
