@@ -20,6 +20,7 @@ st.caption("⚠️ Educational only – non è consulenza finanziaria.")
 # UTILS BASE
 # =========================
 def safe_ticker_info(t):
+    """Ritorna un dict info sempre valido, evitando crash di yfinance."""
     try:
         d = t.info
         return d if isinstance(d, dict) else {}
@@ -27,6 +28,7 @@ def safe_ticker_info(t):
         return {}
 
 def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Se le colonne sono MultiIndex, le appiattisce in stringhe leggibili."""
     if isinstance(df.columns, pd.MultiIndex):
         flat_cols = []
         for col in df.columns:
@@ -37,6 +39,11 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Restituisce un DataFrame con colonne canonicali: Open, High, Low, Close, Volume (+Adj Close se disponibile).
+    Riconosce i nomi indipendentemente dalla posizione del ticker (es. 'AAPL_Close' o 'Close_AAPL').
+    Se 'Close' manca ma esiste 'Adj Close', usa quello come Close.
+    """
     if df is None or df.empty:
         return df
     df = flatten_columns(df)
@@ -44,7 +51,7 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     def find_first(pattern_fn):
         for c in df.columns:
             lc = c.lower()
-            tokens = re.findall(r"[a-z]+", lc)
+            tokens = re.findall(r"[a-z]+", lc)  # tokenizza parole
             if pattern_fn(tokens):
                 return c
         return None
@@ -156,6 +163,205 @@ def backtest_from_signals(close: pd.Series,
     })
     return res, df_bt
 
+# ---------- Utils formattazione ----------
+def fmt_pct(x, na="N/A", digits=2):
+    return (f"{x*100:.{digits}f}%" if isinstance(x, (int, float)) and pd.notna(x) else na)
+
+def fmt_num(x, na="N/A", digits=0):
+    return (f"${x:,.{digits}f}" if isinstance(x, (int, float)) and pd.notna(x) else na)
+
+def safe_get(d: dict, key: str, default=None):
+    try:
+        v = d.get(key, default)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+# ---------- Fondamentali: estrazione (CACHE) ----------
+@st.cache_data(ttl=600, show_spinner=False)  # 10 minuti
+def get_fundamentals(ticker: str) -> dict:
+    """
+    Ritorna:
+      - snapshot: KPI principali per Valuation, Profitability, Growth, Solidità, Dividendi
+      - series: serie annuali/trimestrali (Revenue/Earnings) per grafici
+      - criteria: dizionario di booleane per categoria -> {criterio: True/False}
+    (Lo score viene calcolato separatamente in base ai pesi scelti nell’UI.)
+    """
+    t = yf.Ticker(ticker)
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+
+    # ---- Valuation ----
+    trailing_pe = safe_get(info, "trailingPE")
+    forward_pe = safe_get(info, "forwardPE")
+    peg = safe_get(info, "pegRatio")
+    ps = safe_get(info, "priceToSalesTrailing12Months")
+    pb = safe_get(info, "priceToBook")
+    ev = safe_get(info, "enterpriseValue")
+    ev_to_ebitda = safe_get(info, "enterpriseToEbitda")
+    ev_to_rev = safe_get(info, "enterpriseToRevenue")
+    ebitda = safe_get(info, "ebitda")
+
+    if ev_to_ebitda is None and isinstance(ev, (int, float)) and isinstance(ebitda, (int, float)) and ebitda not in (0, None):
+        ev_to_ebitda = ev / ebitda
+    if ev_to_rev is None and isinstance(ev, (int, float)):
+        revenue_ttm = safe_get(info, "totalRevenue")
+        if isinstance(revenue_ttm, (int, float)) and revenue_ttm not in (0, None):
+            ev_to_rev = ev / revenue_ttm
+
+    # ---- Profitability ----
+    gross_m = safe_get(info, "grossMargins")
+    op_m = safe_get(info, "operatingMargins")
+    net_m = safe_get(info, "profitMargins")
+    roe = safe_get(info, "returnOnEquity")
+    roa = safe_get(info, "returnOnAssets")
+
+    # ---- Growth ----
+    rev_growth = safe_get(info, "revenueGrowth")
+    eps_q_growth = safe_get(info, "earningsQuarterlyGrowth")
+    eps_ttm_growth = safe_get(info, "earningsGrowth")
+
+    # Revenue CAGR da dati annuali
+    revenue_cagr = None
+    rev_series_yearly = None
+    try:
+        df_earn = t.earnings  # annuale: Revenue, Earnings
+        if isinstance(df_earn, pd.DataFrame) and not df_earn.empty and "Revenue" in df_earn.columns:
+            rev_series_yearly = df_earn["Revenue"].dropna()
+            if len(rev_series_yearly) >= 3:
+                first = float(rev_series_yearly.iloc[0]); last = float(rev_series_yearly.iloc[-1])
+                years = len(rev_series_yearly) - 1
+                if first > 0 and years > 0:
+                    revenue_cagr = (last / first) ** (1 / years) - 1
+    except Exception:
+        pass
+
+    # ---- Solidità ----
+    debt_to_equity = safe_get(info, "debtToEquity")
+    current_ratio = safe_get(info, "currentRatio")
+    quick_ratio = safe_get(info, "quickRatio")
+    total_debt = safe_get(info, "totalDebt")
+    total_cash = safe_get(info, "totalCash")
+
+    # ---- Dividendo ----
+    dividend_yield = safe_get(info, "dividendYield")
+    payout_ratio = safe_get(info, "payoutRatio")
+    five_year_yield = safe_get(info, "fiveYearAvgDividendYield")
+
+    # ---- Serie trimestrali per grafici ----
+    rev_series_q = None
+    earn_series_q = None
+    try:
+        qearn = t.quarterly_earnings  # Revenue, Earnings
+        if isinstance(qearn, pd.DataFrame) and not qearn.empty:
+            rev_series_q = qearn["Revenue"].dropna()
+            earn_series_q = qearn["Earnings"].dropna()
+    except Exception:
+        pass
+
+    snapshot = {
+        "Valuation": {
+            "Trailing P/E": trailing_pe,
+            "Forward P/E": forward_pe,
+            "PEG": peg,
+            "P/S (TTM)": ps,
+            "P/B": pb,
+            "EV/EBITDA": ev_to_ebitda,
+            "EV/Revenue": ev_to_rev
+        },
+        "Profitability": {
+            "Gross Margin": gross_m,
+            "Operating Margin": op_m,
+            "Net Margin": net_m,
+            "ROE": roe,
+            "ROA": roa
+        },
+        "Growth": {
+            "Revenue Growth (prov)": rev_growth,
+            "EPS Growth QoQ": eps_q_growth,
+            "EPS Growth TTM": eps_ttm_growth,
+            "Revenue CAGR (annuale)": revenue_cagr
+        },
+        "Solidity": {
+            "Debt/Equity": debt_to_equity,
+            "Current Ratio": current_ratio,
+            "Quick Ratio": quick_ratio,
+            "Total Debt": total_debt,
+            "Total Cash": total_cash
+        },
+        "Dividends": {
+            "Dividend Yield": dividend_yield,
+            "Payout Ratio": payout_ratio,
+            "5Y Avg Yield": five_year_yield
+        }
+    }
+
+    series = {
+        "annual": {"Revenue": rev_series_yearly if isinstance(rev_series_yearly, pd.Series) else None},
+        "quarterly": {
+            "Revenue": rev_series_q if isinstance(rev_series_q, pd.Series) else None,
+            "Earnings": earn_series_q if isinstance(earn_series_q, pd.Series) else None
+        }
+    }
+
+    # ---- Criteri (True/False) per ciascuna categoria ----
+    criteria = {
+        "Profitability": {
+            "ROE > 10%": isinstance(roe, (int, float)) and roe > 0.10,
+            "Operating Margin > 12%": isinstance(op_m, (int, float)) and op_m > 0.12,
+            "Net Margin > 10%": isinstance(net_m, (int, float)) and net_m > 0.10
+        },
+        "Growth": {
+            "Revenue CAGR > 8%": isinstance(revenue_cagr, (int, float)) and revenue_cagr > 0.08,
+            "EPS QoQ > 10%": isinstance(eps_q_growth, (int, float)) and eps_q_growth > 0.10,
+            "EPS TTM > 8%": isinstance(eps_ttm_growth, (int, float)) and eps_ttm_growth > 0.08
+        },
+        "Valuation": {
+            "Forward P/E < 25": isinstance(forward_pe, (int, float)) and forward_pe < 25,
+            "PEG < 1.5": isinstance(peg, (int, float)) and peg < 1.5,
+            "P/S < 6": isinstance(ps, (int, float)) and ps < 6
+        },
+        "Solidity": {
+            "Debt/Equity < 1.0": isinstance(debt_to_equity, (int, float)) and debt_to_equity < 1.0,
+            "Current Ratio > 1.2": isinstance(current_ratio, (int, float)) and current_ratio > 1.2
+        },
+        "Dividends": {
+            "Yield > 1%": isinstance(dividend_yield, (int, float)) and dividend_yield > 0.01,
+            "Payout < 80%": isinstance(payout_ratio, (int, float)) and payout_ratio < 0.80
+        }
+    }
+
+    return {"snapshot": snapshot, "series": series, "criteria": criteria}
+
+def compute_weighted_score(criteria: dict, weights_norm: dict) -> tuple[float, str, list, dict]:
+    """
+    Calcola: score (0..100), band, motivazioni (criteri soddisfatti), contributi per categoria.
+    weights_norm deve sommare a 1.0 (normalizziamo comunque se necessario).
+    """
+    s = sum(max(0.0, float(v)) for v in weights_norm.values())
+    wn = {k: (max(0.0, float(v)) / s if s > 0 else 0.0) for k, v in weights_norm.items()}
+
+    total_score = 0.0
+    reasons = []
+    contributions = {}
+    for cat, tests in criteria.items():
+        tests_list = list(tests.values())
+        n = len(tests_list) if len(tests_list) > 0 else 1
+        passed = sum(1 for v in tests_list if v)
+        cat_ratio = passed / n
+        contrib = cat_ratio * wn.get(cat, 0.0) * 100.0
+        contributions[cat] = contrib
+        total_score += contrib
+        for name, ok in tests.items():
+            if ok:
+                reasons.append(f"{cat}: {name}")
+
+    band = "Strong" if total_score >= 70 else ("Neutral" if total_score >= 50 else "Weak")
+    return total_score, band, reasons, contributions
+
 # =========================
 # COSTANTI
 # =========================
@@ -238,10 +444,31 @@ with right:
     # Parametri backtest
     with st.expander("Parametri Backtest", expanded=False):
         allow_short = st.checkbox("Abilita short (BUY=+1, SELL=-1, HOLD=0)", value=False)
-        fee_bps = st.number_input("Costo per cambio posizione (bps)", min_value=0.0, max_value=50.0, value=2.0, step=0.5,
+        fee_bps = st.number_input("Costo per cambio posizione (bps)", min_value=0.0, max_value=50.0,
+                                  value=2.0, step=0.5,
                                   help="1 bps = 0.01% per trade; applicato a ingressi/uscite/flip")
 
+    # Pesi score fondamentale
+    with st.expander("Pesi Score Fondamentale", expanded=False):
+        w_val = st.slider("Valuation", 0, 100, 20, step=5)
+        w_prof = st.slider("Profitability", 0, 100, 25, step=5)
+        w_growth = st.slider("Growth", 0, 100, 30, step=5)
+        w_sol = st.slider("Solidità", 0, 100, 15, step=5)
+        w_div = st.slider("Dividendi", 0, 100, 10, step=5)
+        w_sum = w_val + w_prof + w_growth + w_sol + w_div
+        st.caption(f"Somma pesi: **{w_sum}** (verrà normalizzata automaticamente a 100)")
+
     run_analysis = st.button("🔎 Analizza")
+
+# normalizza pesi (usati ovunque)
+weights_raw = {
+    "Valuation": w_val,
+    "Profitability": w_prof,
+    "Growth": w_growth,
+    "Solidity": w_sol,
+    "Dividends": w_div
+}
+weights_norm = {k: (v / (w_sum if w_sum > 0 else 1.0)) for k, v in weights_raw.items()}
 
 st.markdown("---")
 
@@ -258,19 +485,19 @@ if run_analysis or "last_signal" not in st.session_state:
             st.write("Colonne disponibili:", list(data.columns))
         st.stop()
 
-    if data.shape[0] < max(50, macd_slow + 5):
+    if data.shape[0] < max(50, int(macd_slow) + 5):
         st.warning("Storico relativamente corto: indicatori a 50 periodi e MACD potrebbero essere meno affidabili.")
 
     # ===== TECNICO (parametric) =====
     close = data["Close"].astype(float)
-    data["EMA_fast"] = ema(close, ema_fast)
-    data["EMA_slow"] = ema(close, ema_slow)
+    data["EMA_fast"] = ema(close, int(ema_fast))
+    data["EMA_slow"] = ema(close, int(ema_slow))
     data["RSI14"] = rsi(close, 14)
-    data["MACD"], data["MACD_signal"], data["MACD_hist"] = macd(close, macd_fast, macd_slow, macd_signal)
+    data["MACD"], data["MACD_signal"], data["MACD_hist"] = macd(close, int(macd_fast), int(macd_slow), int(macd_signal))
     data["KC_mid"], data["KC_upper"], data["KC_lower"] = keltner_channels(
-        data, ema_period=ema_fast, atr_period=keltner_atr_period, atr_mult=keltner_mult
+        data, ema_period=int(ema_fast), atr_period=int(keltner_atr_period), atr_mult=float(keltner_mult)
     )
-    data["ATR14"] = atr(data, atr_period)
+    data["ATR14"] = atr(data, int(atr_period))
 
     last = data.iloc[-1]
     last_price = float(last["Close"])
@@ -307,13 +534,20 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         stop_loss = take_profit_1 = take_profit_2 = np.nan
 
-    # ===== Fondamentale (semplice) =====
+    # ===== Fondamentale (esteso con criteri) =====
+    fund = get_fundamentals(ticker)
+    snapshot = fund["snapshot"]
+    series = fund["series"]
+    criteria = fund["criteria"]
+
+    # Score pesato (0..100) + band + motivazioni + contributi per categoria
+    fscore100, fband, freasons, fcontrib = compute_weighted_score(criteria, weights_norm)
+
+    # Classificazioni base per final_signal (cap_type / pe_status)
     t_obj = yf.Ticker(ticker)
-    info = safe_ticker_info(t_obj)
-    eps_qoq = info.get("earningsQuarterlyGrowth", None)
-    eps_ttm = info.get("earningsGrowth", None)
-    market_cap = info.get("marketCap", None)
-    pe_ratio = info.get("trailingPE", None)
+    info_basic = safe_ticker_info(t_obj)
+    market_cap = safe_get(info_basic, "marketCap")
+    pe_ratio = safe_get(info_basic, "trailingPE")
 
     if market_cap:
         if market_cap > 10_000_000_000:
@@ -335,11 +569,10 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         pe_status = "N/A"
 
-    fundamental_ok = False
-    if isinstance(eps_qoq, (int, float)) and isinstance(eps_ttm, (int, float)) and isinstance(pe_ratio, (int, float)):
-        if eps_qoq > 0.10 and eps_ttm > 0.10 and pe_ratio < 25:
-            fundamental_ok = True
+    # Usa lo score pesato per la validazione fondamentale
+    fundamental_ok = fscore100 >= 60.0
 
+    # ===== SEGNALE FINALE =====
     if tech_signal == "BUY" and fundamental_ok:
         final_signal = "BUY STRONG ⭐" if cap_type == "Large Cap" else "BUY STRONG"
     elif tech_signal == "BUY" and pe_status == "HIGH":
@@ -362,9 +595,9 @@ if run_analysis or "last_signal" not in st.session_state:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Prezzo", mode="lines"))
         if data["EMA_fast"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_fast"], name=f"EMA{ema_fast}", mode="lines"))
+            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_fast"], name=f"EMA{int(ema_fast)}", mode="lines"))
         if data["EMA_slow"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_slow"], name=f"EMA{ema_slow}", mode="lines"))
+            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_slow"], name=f"EMA{int(ema_slow)}", mode="lines"))
         if data["KC_upper"].notna().any():
             fig.add_trace(go.Scatter(x=data.index, y=data["KC_upper"], name="Keltner Alta", mode="lines",
                                      line=dict(dash="dash", color="#888")))
@@ -394,17 +627,160 @@ if run_analysis or "last_signal" not in st.session_state:
                                   yaxis=dict(range=[0,100]))
             st.plotly_chart(fig_rsi, use_container_width=True)
 
-    # FONDAMENTALE
+    # FONDAMENTALE (pesi custom)
     with tab2:
-        st.subheader("Analisi Fondamentale")
-        def fmt_pct(x): return f"{x:.2%}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
-        def fmt_num(x): return f"${x:,.0f}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
-        def fmt_pe(x):  return f"{x:.2f}" if isinstance(x, (int,float)) and pd.notna(x) else "N/A"
+        st.subheader("Analisi Fondamentale (pesi personalizzati)")
 
-        st.write(f"EPS QoQ: {fmt_pct(eps_qoq)}")
-        st.write(f"EPS TTM: {fmt_pct(eps_ttm)}")
-        st.write(f"Market Cap: {fmt_num(market_cap)} ({cap_type})")
-        st.write(f"P/E: {fmt_pe(pe_ratio)} ({pe_status})")
+        # Score complessivo
+        color = "#3CB371" if fband == "Strong" else ("#F0AD4E" if fband == "Neutral" else "#D9534F")
+        st.markdown(
+            f"**Fundamental Score:** "
+            f"<span style='color:{color}; font-size:20px'><b>{fscore100:.1f}/100 – {fband}</b></span>",
+            unsafe_allow_html=True
+        )
+        with st.expander("Motivazioni (criteri rispettati)"):
+            if freasons:
+                for r in freasons:
+                    st.write(f"• {r}")
+            else:
+                st.write("Nessun criterio soddisfatto (dati incompleti o metriche deboli).")
+
+        # Snapshot KPI sintetico
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            st.caption("Valuation")
+            st.metric("Forward P/E", f"{snapshot['Valuation']['Forward P/E']:.2f}" if isinstance(snapshot['Valuation']['Forward P/E'], (int,float)) else "N/A")
+            st.metric("PEG", f"{snapshot['Valuation']['PEG']:.2f}" if isinstance(snapshot['Valuation']['PEG'], (int,float)) else "N/A")
+        with k2:
+            st.caption("Profitability")
+            st.metric("ROE", fmt_pct(snapshot["Profitability"]["ROE"]))
+            st.metric("Net Margin", fmt_pct(snapshot["Profitability"]["Net Margin"]))
+        with k3:
+            st.caption("Growth")
+            st.metric("Rev CAGR", fmt_pct(snapshot["Growth"]["Revenue CAGR (annuale)"]))
+            st.metric("EPS QoQ", fmt_pct(snapshot["Growth"]["EPS Growth QoQ"]))
+        with k4:
+            st.caption("Solidità")
+            de = snapshot["Solidity"]["Debt/Equity"]
+            st.metric("Debt/Equity", f"{de:.2f}" if isinstance(de, (int,float)) else "N/A")
+            cr = snapshot["Solidity"]["Current Ratio"]
+            st.metric("Current Ratio", f"{cr:.2f}" if isinstance(cr, (int,float)) else "N/A")
+        with k5:
+            st.caption("Dividendi")
+            st.metric("Yield", fmt_pct(snapshot["Dividends"]["Dividend Yield"]))
+            st.metric("Payout", fmt_pct(snapshot["Dividends"]["Payout Ratio"]))
+
+        st.markdown("---")
+
+        # Contributo per categoria e pesi
+        contrib_df = pd.DataFrame({
+            "Categoria": list(fcontrib.keys()),
+            "Contributo (%)": [round(v, 2) for v in fcontrib.values()],
+            "Peso (%)": [round(weights_norm[k]*100.0, 2) for k in fcontrib.keys()]
+        })
+        fig_contrib = go.Figure()
+        fig_contrib.add_trace(go.Bar(
+            x=contrib_df["Categoria"], y=contrib_df["Contributo (%)"],
+            name="Contributo allo score", marker_color="#6aa84f"
+        ))
+        fig_contrib.add_trace(go.Scatter(
+            x=contrib_df["Categoria"], y=contrib_df["Peso (%)"],
+            name="Peso assegnato", mode="lines+markers", line=dict(color="#888", dash="dot")
+        ))
+        fig_contrib.update_layout(template="plotly_dark", height=320, margin=dict(t=20,l=10,r=10,b=10),
+                                  yaxis_title="Percentuale")
+        st.plotly_chart(fig_contrib, use_container_width=True)
+
+        st.markdown("---")
+
+        # Tabelle dettagliate
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Valuation**")
+            v = snapshot["Valuation"]
+            st.write({
+                "Trailing P/E": v["Trailing P/E"],
+                "Forward P/E": v["Forward P/E"],
+                "PEG": v["PEG"],
+                "P/S (TTM)": v["P/S (TTM)"],
+                "P/B": v["P/B"],
+                "EV/EBITDA": v["EV/EBITDA"],
+                "EV/Revenue": v["EV/Revenue"]
+            })
+
+            st.markdown("**Profitability**")
+            p = snapshot["Profitability"]
+            st.write({
+                "Gross Margin": fmt_pct(p["Gross Margin"]),
+                "Operating Margin": fmt_pct(p["Operating Margin"]),
+                "Net Margin": fmt_pct(p["Net Margin"]),
+                "ROE": fmt_pct(p["ROE"]),
+                "ROA": fmt_pct(p["ROA"])
+            })
+
+        with c2:
+            st.markdown("**Growth**")
+            g = snapshot["Growth"]
+            st.write({
+                "Revenue Growth (prov)": fmt_pct(g["Revenue Growth (prov)"]),
+                "EPS Growth QoQ": fmt_pct(g["EPS Growth QoQ"]),
+                "EPS Growth TTM": fmt_pct(g["EPS Growth TTM"]),
+                "Revenue CAGR (annuale)": fmt_pct(g["Revenue CAGR (annuale)"])
+            })
+
+            st.markdown("**Solidità & Dividendi**")
+            s = snapshot["Solidity"]; d = snapshot["Dividends"]
+            st.write({
+                "Debt/Equity": s["Debt/Equity"] if isinstance(s["Debt/Equity"], (int,float)) else "N/A",
+                "Current Ratio": s["Current Ratio"] if isinstance(s["Current Ratio"], (int,float)) else "N/A",
+                "Quick Ratio": s["Quick Ratio"] if isinstance(s["Quick Ratio"], (int,float)) else "N/A",
+                "Total Debt": fmt_num(s["Total Debt"]),
+                "Total Cash": fmt_num(s["Total Cash"]),
+                "Dividend Yield": fmt_pct(d["Dividend Yield"]),
+                "Payout Ratio": fmt_pct(d["Payout Ratio"]),
+                "5Y Avg Yield": fmt_pct(d["5Y Avg Yield"])
+            })
+
+        st.markdown("---")
+
+        # Grafici di trend Ricavi / Utili
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("**Ricavi & Utile – Annuale**")
+            try:
+                df_earn = yf.Ticker(ticker).earnings
+                if isinstance(df_earn, pd.DataFrame) and not df_earn.empty:
+                    fig = go.Figure()
+                    if "Revenue" in df_earn.columns:
+                        fig.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Revenue"], name="Revenue"))
+                    if "Earnings" in df_earn.columns:
+                        fig.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Earnings"], name="Earnings"))
+                    fig.update_layout(template="plotly_dark", barmode="group", height=320,
+                                      margin=dict(t=10,l=10,r=10,b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Dati annuali non disponibili.")
+            except Exception as e:
+                st.warning(f"Dati annuali non disponibili: {e}")
+
+        with g2:
+            st.markdown("**Ricavi & Utile – Trimestrale**")
+            try:
+                qearn = yf.Ticker(ticker).quarterly_earnings
+                if isinstance(qearn, pd.DataFrame) and not qearn.empty:
+                    figq = go.Figure()
+                    if "Revenue" in qearn.columns:
+                        figq.add_trace(go.Scatter(x=qearn.index.astype(str), y=qearn["Revenue"],
+                                                  name="Revenue", mode="lines+markers"))
+                    if "Earnings" in qearn.columns:
+                        figq.add_trace(go.Scatter(x=qearn.index.astype(str), y=qearn["Earnings"],
+                                                  name="Earnings", mode="lines+markers"))
+                    figq.update_layout(template="plotly_dark", height=320, margin=dict(t=10,l=10,r=10,b=10))
+                    st.plotly_chart(figq, use_container_width=True)
+                else:
+                    st.info("Dati trimestrali non disponibili.")
+            except Exception as e:
+                st.warning(f"Dati trimestrali non disponibili: {e}")
 
     # CONSIGLIO
     with tab3:
@@ -451,7 +827,7 @@ if run_analysis or "last_signal" not in st.session_state:
         sig_sell = cond_down & cond_macd_bear_s & cond_rsi_bear_s
         signals = pd.Series(np.where(sig_buy, "BUY", np.where(sig_sell, "SELL", "HOLD")), index=df.index)
 
-        metrics, bt = backtest_from_signals(df["Close"], signals, allow_short=allow_short, fee_bps=fee_bps)
+        metrics, bt = backtest_from_signals(df["Close"], signals, allow_short=allow_short, fee_bps=float(fee_bps))
 
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         kpi1.metric("CAGR", f"{metrics['cagr']*100:,.2f}%" if pd.notna(metrics['cagr']) else "N/A")
