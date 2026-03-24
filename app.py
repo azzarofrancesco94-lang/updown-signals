@@ -405,23 +405,68 @@ def get_history_normalized(ticker: str, period: str) -> pd.DataFrame:
 # =========================
 left, right = st.columns([3, 1], gap="large")
 
+
 with left:
     st.subheader("🗺️ Market Heatmap (Daily)")
+
     df_heat = build_heatmap_df(HEATMAP_TICKERS)
 
     if not df_heat.empty:
+        # 1) Preparo una colonna formattata per le % (con + per i positivi)
+        df_heat = df_heat.copy()
+        df_heat["ChangePctStr"] = df_heat["Change"].apply(
+            lambda x: f"+{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) and x >= 0
+                      else (f"{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) else "N/A")
+        )
+
+        # 2) Treemap con testo personalizzato: Ticker in grassetto, % sotto
+        #    - 'label' di livello foglia è il Ticker (per path=["Sector","Ticker"])
+        #    - passo la % come customdata per la texttemplate
         fig_heat = px.treemap(
             df_heat,
-            path=["Sector","Ticker"],
+            path=["Sector", "Ticker"],
             values="MarketCap",
             color="Change",
-            color_continuous_scale=["red","black","green"],
-            color_continuous_midpoint=0
+            color_continuous_scale=["#b00020", "#222222", "#00a86b"],  # rosso scuro → nero → verde
+            color_continuous_midpoint=0,
+            custom_data=["ChangePctStr"]  # sarà %{customdata[0]}
         )
-        fig_heat.update_layout(template="plotly_dark", margin=dict(t=30, l=10, r=10, b=10), height=520)
+
+        # 3) Template del testo al centro del riquadro (ticker su riga 1, % su riga 2)
+        fig_heat.data[0].texttemplate = "<b>%{label}</b><br>%{customdata[0]}"
+        fig_heat.data[0].textposition = "middle center"
+
+        # 4) Font e leggibilità (dimensione media, colore testo automatico)
+        #    NB: Plotly seleziona automaticamente il colore del testo (treemaptextfont) per contrasto; forziamo size.
+        fig_heat.update_traces(textfont=dict(size=16))  # medium
+        # opzionale: aggiungi bordo per migliorare separazione
+        fig_heat.update_traces(marker=dict(line=dict(width=1, color="rgba(255,255,255,0.15)")))
+
+        # 5) Layout generale
+        fig_heat.update_layout(
+            template="plotly_dark",
+            margin=dict(t=30, l=10, r=10, b=10),
+            height=520,
+            coloraxis_colorbar=dict(
+                title="Δ Giornaliero",
+                tickformat="+.1%",
+                thickness=12,
+                len=0.75
+            )
+        )
+
+        # 6) Hover personalizzato (settore, market cap, %)
+        fig_heat.data[0].hovertemplate = (
+            "<b>%{label}</b><br>"
+            "Settore: %{parent}<br>"
+            "Market Cap: %{value:,}<br>"
+            "Performance: %{customdata[0]}<extra></extra>"
+        )
+
         st.plotly_chart(fig_heat, use_container_width=True)
     else:
         st.info("Nessun dato disponibile per la heatmap.")
+
 
 with right:
     st.subheader("⚙️ Impostazioni")
