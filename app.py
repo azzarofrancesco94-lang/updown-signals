@@ -1,11 +1,5 @@
 # app.py
 import re
-import os
-import ssl
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -26,7 +20,6 @@ st.caption("⚠️ Educational only – non è consulenza finanziaria.")
 # UTILS BASE
 # =========================
 def safe_ticker_info(t):
-    """Restituisce un dict info sempre valido (evita crash se yfinance fallisce)."""
     try:
         d = t.info
         return d if isinstance(d, dict) else {}
@@ -34,7 +27,6 @@ def safe_ticker_info(t):
         return {}
 
 def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Se le colonne sono MultiIndex, le appiattisce in stringhe leggibili."""
     if isinstance(df.columns, pd.MultiIndex):
         flat_cols = []
         for col in df.columns:
@@ -45,20 +37,14 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Restituisce un DataFrame con colonne canonicali: Open, High, Low, Close, Volume (+Adj Close se disponibile).
-    Riconosce i nomi indipendentemente dalla posizione del ticker (es. 'AAPL_Close' o 'Close_AAPL').
-    Se 'Close' manca ma esiste 'Adj Close', usa quello come Close.
-    """
     if df is None or df.empty:
         return df
-
     df = flatten_columns(df)
 
     def find_first(pattern_fn):
         for c in df.columns:
             lc = c.lower()
-            tokens = re.findall(r"[a-z]+", lc)  # tokenizza parole
+            tokens = re.findall(r"[a-z]+", lc)
             if pattern_fn(tokens):
                 return c
         return None
@@ -78,7 +64,6 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
     if "Close" not in out.columns and "Adj Close" in out.columns:
         out["Close"] = out["Adj Close"]
-
     return out
 
 # ---------- Indicatori tecnici ----------
@@ -123,13 +108,11 @@ def backtest_from_signals(close: pd.Series,
                           allow_short: bool = False,
                           fee_bps: float = 0.0):
     """
-    Esegue un backtest semplice daily:
+    Backtest semplice daily:
     - positions: 1 per BUY, 0 HOLD (o -1 per SELL se allow_short)
-    - execution: a mercato successivo (shift delle posizioni)
+    - esecuzione T+1 (shift delle posizioni)
     - costi: fee_bps applicato al cambio posizione (entry/exit/flip)
-    Ritorna: dict con metrics + DataFrame con equity e drawdown.
     """
-    # Ritorni logici
     ret = close.pct_change().fillna(0.0)
 
     if allow_short:
@@ -138,9 +121,8 @@ def backtest_from_signals(close: pd.Series,
     else:
         pos = np.where(signal_series == "BUY", 1, 0)
 
-    pos = pd.Series(pos, index=close.index).shift(1).fillna(0.0)  # no look-ahead
+    pos = pd.Series(pos, index=close.index).shift(1).fillna(0.0)
 
-    # Costi transazione su cambi posizione
     pos_change = pos.diff().abs().fillna(pos.abs())
     fee = (fee_bps / 10_000.0) * pos_change
 
@@ -150,7 +132,6 @@ def backtest_from_signals(close: pd.Series,
     drawdown = (equity / high_watermark) - 1.0
     max_dd = drawdown.min()
 
-    # Metriche annualizzate (assume ~252 giorni borsa/anno)
     n = len(strat_ret)
     total_return = equity.iloc[-1] - 1.0
     cagr = (equity.iloc[-1]) ** (252.0 / max(n, 1)) - 1.0 if n > 0 else np.nan
@@ -175,36 +156,6 @@ def backtest_from_signals(close: pd.Series,
     })
     return res, df_bt
 
-# ---------- Notifiche email ----------
-def send_email(subject: str, body_html: str, recipients: list[str]) -> tuple[bool, str]:
-    """Invia email via SMTP usando st.secrets[email]."""
-    try:
-        cfg = st.secrets.get("email", {})
-        host = cfg.get("smtp_host")
-        port = int(cfg.get("smtp_port", 587))
-        user = cfg.get("smtp_user")
-        pwd  = cfg.get("smtp_password")
-        sender = cfg.get("sender", user)
-
-        if not (host and port and user and pwd and sender):
-            return False, "Config email mancante in st.secrets[email]."
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = ", ".join(recipients)
-        msg.attach(MIMEText(body_html, "html"))
-
-        context = ssl.create_default_context()
-        with smtplib.SMTP(host, port) as server:
-            server.starttls(context=context)
-            server.login(user, pwd)
-            server.sendmail(sender, recipients, msg.as_string())
-
-        return True, "Email inviata."
-    except Exception as e:
-        return False, f"Errore invio email: {e}"
-
 # =========================
 # COSTANTI
 # =========================
@@ -215,18 +166,15 @@ HEATMAP_TICKERS = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX","BBV
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)  # 5 minuti
 def build_heatmap_df(tickers: list) -> pd.DataFrame:
-    """Crea il DataFrame per la heatmap (settoriale, change %, market cap)."""
     rows = []
     for t in tickers:
         try:
             stock = yf.Ticker(t)
             info = safe_ticker_info(stock)
-
             price = info.get("currentPrice", None)
             prev = info.get("previousClose", None)
             market_cap = info.get("marketCap", 1)
             sector = info.get("sector", "Other")
-
             if isinstance(price, (int, float)) and isinstance(prev, (int, float)) and prev not in (0, None):
                 change = (price - prev) / prev
                 rows.append({
@@ -241,7 +189,6 @@ def build_heatmap_df(tickers: list) -> pd.DataFrame:
 
 @st.cache_data(ttl=120, show_spinner=False)  # 2 minuti
 def get_history_normalized(ticker: str, period: str) -> pd.DataFrame:
-    """Scarica lo storico yfinance e restituisce OHLCV normalizzato."""
     raw = yf.download(ticker, period=period, progress=False, auto_adjust=False, group_by="column")
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -294,13 +241,6 @@ with right:
         fee_bps = st.number_input("Costo per cambio posizione (bps)", min_value=0.0, max_value=50.0, value=2.0, step=0.5,
                                   help="1 bps = 0.01% per trade; applicato a ingressi/uscite/flip")
 
-    # Notifiche email
-    with st.expander("Notifiche Email", expanded=False):
-        enable_email = st.checkbox("Invia email quando il segnale cambia", value=False)
-        default_rcpt = st.secrets.get("email", {}).get("default_recipients", "")
-        recipients_text = st.text_input("Destinatari (separati da virgola)", value=default_rcpt)
-        test_email = st.button("Invia email di test")
-
     run_analysis = st.button("🔎 Analizza")
 
 st.markdown("---")
@@ -318,9 +258,8 @@ if run_analysis or "last_signal" not in st.session_state:
             st.write("Colonne disponibili:", list(data.columns))
         st.stop()
 
-    # Guardrail min barre per indicatori a 50 periodi e MACD
-    if data.shape[0] < max(ema_slow, macd_slow) + 5:
-        st.warning("Storico relativamente corto: indicatori potrebbero essere meno affidabili.")
+    if data.shape[0] < max(50, macd_slow + 5):
+        st.warning("Storico relativamente corto: indicatori a 50 periodi e MACD potrebbero essere meno affidabili.")
 
     # ===== TECNICO (parametric) =====
     close = data["Close"].astype(float)
@@ -337,7 +276,6 @@ if run_analysis or "last_signal" not in st.session_state:
     last_price = float(last["Close"])
     atr14 = float(last["ATR14"]) if pd.notna(last["ATR14"]) else np.nan
 
-    # Regole segnale (parametriche)
     cond_trend_up   = last["EMA_fast"] > last["EMA_slow"]
     cond_trend_down = last["EMA_fast"] < last["EMA_slow"]
     cond_above_mid  = last_price > last["KC_mid"]
@@ -369,10 +307,9 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         stop_loss = take_profit_1 = take_profit_2 = np.nan
 
-    # ===== Segnale fondamentale (semplice come in precedenza) =====
+    # ===== Fondamentale (semplice) =====
     t_obj = yf.Ticker(ticker)
     info = safe_ticker_info(t_obj)
-
     eps_qoq = info.get("earningsQuarterlyGrowth", None)
     eps_ttm = info.get("earningsGrowth", None)
     market_cap = info.get("marketCap", None)
@@ -403,7 +340,6 @@ if run_analysis or "last_signal" not in st.session_state:
         if eps_qoq > 0.10 and eps_ttm > 0.10 and pe_ratio < 25:
             fundamental_ok = True
 
-    # Segnale finale
     if tech_signal == "BUY" and fundamental_ok:
         final_signal = "BUY STRONG ⭐" if cap_type == "Large Cap" else "BUY STRONG"
     elif tech_signal == "BUY" and pe_status == "HIGH":
@@ -415,40 +351,6 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         final_signal = "HOLD"
 
-    # ======= NOTIFICHE EMAIL =======
-    if enable_email:
-        rcpts = [x.strip() for x in recipients_text.split(",") if x.strip()]
-        last_key = f"last_signal_{ticker}"
-        prev_sig = st.session_state.get(last_key)
-
-        if test_email:
-            ok, msg = send_email(
-                subject=f"[TEST] UpDown Signals - {ticker}",
-                body_html=f"<h3>Test email</h3><p>App attiva. Ultimo segnale calcolato: <b>{final_signal}</b></p>",
-                recipients=rcpts
-            )
-            st.info(msg if ok else f"❌ {msg}")
-
-        if prev_sig != final_signal and rcpts:
-            html = f"""
-            <h3>Segnale aggiornato per {ticker}</h3>
-            <p><b>Nuovo segnale:</b> {final_signal}</p>
-            <ul>
-                <li><b>Tecnico:</b> {tech_signal}</li>
-                <li><b>Prezzo:</b> {last_price:.2f}</li>
-                <li><b>SL:</b> {stop_loss if pd.notna(stop_loss) else 'N/A'}</li>
-                <li><b>TP1:</b> {take_profit_1 if pd.notna(take_profit_1) else 'N/A'}</li>
-                <li><b>TP2:</b> {take_profit_2 if pd.notna(take_profit_2) else 'N/A'}</li>
-            </ul>
-            <p><b>Parametri:</b> EMA_fast={ema_fast}, EMA_slow={ema_slow}, ATR={atr_period}, Keltner_ATR={keltner_atr_period}, Mult={keltner_mult}, MACD=({macd_fast},{macd_slow},{macd_signal}), RSI_filter={use_rsi}</p>
-            """
-            ok, msg = send_email(subject=f"UpDown Signals - {ticker}: {final_signal}",
-                                 body_html=html,
-                                 recipients=rcpts)
-            st.info(msg if ok else f"❌ {msg}")
-
-        st.session_state[last_key] = final_signal
-
     # ===== TABS =====
     tab1, tab2, tab3, tab4 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio", "📚 Backtest"])
 
@@ -457,7 +359,6 @@ if run_analysis or "last_signal" not in st.session_state:
         st.subheader("Analisi Tecnica (parametric)")
         st.write(f"Segnale tecnico: **{tech_signal}**  |  Segnale finale: **{final_signal}**")
 
-        # Prezzo + EMA + Keltner
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Prezzo", mode="lines"))
         if data["EMA_fast"].notna().any():
@@ -476,7 +377,6 @@ if run_analysis or "last_signal" not in st.session_state:
         fig.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Sotto-pannello: MACD e RSI
         c1, c2 = st.columns(2)
         with c1:
             fig_macd = go.Figure()
@@ -535,9 +435,7 @@ if run_analysis or "last_signal" not in st.session_state:
     # BACKTEST
     with tab4:
         st.subheader("📚 Backtest")
-        # Costruisci serie segnali storici con regole parametriche
         df = data.copy()
-        # condizioni bool su tutta la serie
         cond_up = (df["EMA_fast"] > df["EMA_slow"]) & (df["Close"] > df["KC_mid"])
         cond_down = (df["EMA_fast"] < df["EMA_slow"]) & (df["Close"] < df["KC_mid"])
         cond_macd_bull_s = (df["MACD"] > df["MACD_signal"])
@@ -555,25 +453,23 @@ if run_analysis or "last_signal" not in st.session_state:
 
         metrics, bt = backtest_from_signals(df["Close"], signals, allow_short=allow_short, fee_bps=fee_bps)
 
-        # KPI
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         kpi1.metric("CAGR", f"{metrics['cagr']*100:,.2f}%" if pd.notna(metrics['cagr']) else "N/A")
         kpi2.metric("Max Drawdown", f"{metrics['max_drawdown']*100:,.2f}%" if pd.notna(metrics['max_drawdown']) else "N/A")
         kpi3.metric("Sharpe", f"{metrics['sharpe']:.2f}" if pd.notna(metrics['sharpe']) else "N/A")
         kpi4.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
 
-        # Equity curve
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(x=bt.index, y=bt["Equity"], name="Strategia", mode="lines"))
-        fig_eq.add_trace(go.Scatter(x=bt.index, y=(bt["Close"] / bt["Close"].iloc[0]), name="Buy & Hold", mode="lines",
-                                    line=dict(color="#888", dash="dot")))
+        fig_eq.add_trace(go.Scatter(x=bt.index, y=(bt["Close"] / bt["Close"].iloc[0]), name="Buy & Hold",
+                                    mode="lines", line=dict(color="#888", dash="dot")))
         fig_eq.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10),
                              yaxis_title="Equity (base=1.0)")
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        # Drawdown chart
         fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(x=bt.index, y=bt["Drawdown"], name="Drawdown", mode="lines", line=dict(color="#d9534f")))
+        fig_dd.add_trace(go.Scatter(x=bt.index, y=bt["Drawdown"], name="Drawdown",
+                                    mode="lines", line=dict(color="#d9534f")))
         fig_dd.update_layout(template="plotly_dark", height=240, margin=dict(t=20,l=10,r=10,b=10),
                              yaxis_tickformat=".0%")
         st.plotly_chart(fig_dd, use_container_width=True)
