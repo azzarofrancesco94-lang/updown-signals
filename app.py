@@ -405,44 +405,38 @@ def get_history_normalized(ticker: str, period: str) -> pd.DataFrame:
 # =========================
 left, right = st.columns([3, 1], gap="large")
 
-
 with left:
     st.subheader("🗺️ Market Heatmap (Daily)")
-
     df_heat = build_heatmap_df(HEATMAP_TICKERS)
 
     if not df_heat.empty:
-        # 1) Preparo una colonna formattata per le % (con + per i positivi)
+        # Percentuale formattata con segno
         df_heat = df_heat.copy()
         df_heat["ChangePctStr"] = df_heat["Change"].apply(
             lambda x: f"+{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) and x >= 0
-                      else (f"{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) else "N/A")
+            else (f"{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) else "N/A")
         )
 
-        # 2) Treemap con testo personalizzato: Ticker in grassetto, % sotto
-        #    - 'label' di livello foglia è il Ticker (per path=["Sector","Ticker"])
-        #    - passo la % come customdata per la texttemplate
         fig_heat = px.treemap(
             df_heat,
             path=["Sector", "Ticker"],
             values="MarketCap",
             color="Change",
-            color_continuous_scale=["#b00020", "#222222", "#00a86b"],  # rosso scuro → nero → verde
+            color_continuous_scale=["#b00020", "#222222", "#00a86b"],
             color_continuous_midpoint=0,
-            custom_data=["ChangePctStr"]  # sarà %{customdata[0]}
+            custom_data=["ChangePctStr"]
         )
-
-        # 3) Template del testo al centro del riquadro (ticker su riga 1, % su riga 2)
+        # Testo centrale: ticker (bold) + % sotto
         fig_heat.data[0].texttemplate = "<b>%{label}</b><br>%{customdata[0]}"
         fig_heat.data[0].textposition = "middle center"
-
-        # 4) Font e leggibilità (dimensione media, colore testo automatico)
-        #    NB: Plotly seleziona automaticamente il colore del testo (treemaptextfont) per contrasto; forziamo size.
-        fig_heat.update_traces(textfont=dict(size=16))  # medium
-        # opzionale: aggiungi bordo per migliorare separazione
+        fig_heat.update_traces(textfont=dict(size=16))
         fig_heat.update_traces(marker=dict(line=dict(width=1, color="rgba(255,255,255,0.15)")))
-
-        # 5) Layout generale
+        fig_heat.data[0].hovertemplate = (
+            "<b>%{label}</b><br>"
+            "Settore: %{parent}<br>"
+            "Market Cap: %{value:,}<br>"
+            "Performance: %{customdata[0]}<extra></extra>"
+        )
         fig_heat.update_layout(
             template="plotly_dark",
             margin=dict(t=30, l=10, r=10, b=10),
@@ -454,19 +448,9 @@ with left:
                 len=0.75
             )
         )
-
-        # 6) Hover personalizzato (settore, market cap, %)
-        fig_heat.data[0].hovertemplate = (
-            "<b>%{label}</b><br>"
-            "Settore: %{parent}<br>"
-            "Market Cap: %{value:,}<br>"
-            "Performance: %{customdata[0]}<extra></extra>"
-        )
-
         st.plotly_chart(fig_heat, use_container_width=True)
     else:
         st.info("Nessun dato disponibile per la heatmap.")
-
 
 with right:
     st.subheader("⚙️ Impostazioni")
@@ -579,7 +563,7 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         stop_loss = take_profit_1 = take_profit_2 = np.nan
 
-    # ===== Fondamentale (esteso con criteri) =====
+    # ===== Fondamentale (esteso con criteri + pesi) =====
     fund = get_fundamentals(ticker)
     snapshot = fund["snapshot"]
     series = fund["series"]
@@ -632,45 +616,86 @@ if run_analysis or "last_signal" not in st.session_state:
     # ===== TABS =====
     tab1, tab2, tab3, tab4 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio", "📚 Backtest"])
 
-    # TECNICA
+    # TECNICA — grafico migliorato per leggere EMA_fast > EMA_slow
     with tab1:
-        st.subheader("Analisi Tecnica (parametric)")
-        st.write(f"Segnale tecnico: **{tech_signal}**  |  Segnale finale: **{final_signal}**")
+        st.subheader("Analisi Tecnica (Trend + EMA spread)")
+        st.write(
+            f"Segnale tecnico: **{tech_signal}** — "
+            f"EMA_fast({int(ema_fast)}): **{data['EMA_fast'].iloc[-1]:.2f}** | "
+            f"EMA_slow({int(ema_slow)}): **{data['EMA_slow'].iloc[-1]:.2f}** | "
+            f"Δ: **{(data['EMA_fast'].iloc[-1] - data['EMA_slow'].iloc[-1]):.2f}**"
+        )
+
+        fast = data["EMA_fast"]
+        slow = data["EMA_slow"]
+        spread = fast - slow
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Prezzo", mode="lines"))
-        if data["EMA_fast"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_fast"], name=f"EMA{int(ema_fast)}", mode="lines"))
-        if data["EMA_slow"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["EMA_slow"], name=f"EMA{int(ema_slow)}", mode="lines"))
-        if data["KC_upper"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["KC_upper"], name="Keltner Alta", mode="lines",
-                                     line=dict(dash="dash", color="#888")))
-        if data["KC_lower"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["KC_lower"], name="Keltner Bassa", mode="lines",
-                                     line=dict(dash="dash", color="#888")))
-        if data["KC_mid"].notna().any():
-            fig.add_trace(go.Scatter(x=data.index, y=data["KC_mid"], name="Keltner Mid", mode="lines",
-                                     line=dict(color="#aaa")))
-        fig.update_layout(template="plotly_dark", height=420, margin=dict(t=20,l=10,r=10,b=10))
+        # Prezzo
+        fig.add_trace(go.Scatter(
+            x=data.index, y=data["Close"], name="Prezzo", mode="lines",
+            line=dict(color="#cfcfcf", width=1.5)
+        ))
+        # EMA slow (rossa, tratteggiata)
+        fig.add_trace(go.Scatter(
+            x=data.index, y=slow, name=f"EMA{int(ema_slow)} (slow)",
+            mode="lines", line=dict(color="#FF6347", width=2, dash="dash")
+        ))
+        # EMA fast (oro)
+        fig.add_trace(go.Scatter(
+            x=data.index, y=fast, name=f"EMA{int(ema_fast)} (fast)",
+            mode="lines", line=dict(color="#FFD700", width=2.5)
+        ))
+
+        # Fill verde dove fast>slow
+        y_upper = np.where(fast > slow, fast, slow)
+        y_lower = np.where(fast > slow, slow, fast)
+        fig.add_trace(go.Scatter(x=data.index, y=y_upper, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=data.index, y=y_lower, line=dict(width=0), showlegend=False, hoverinfo="skip",
+            fill="tonexty", fillcolor="rgba(0, 170, 0, 0.10)", name="Zona fast>slow"
+        ))
+
+        # Fill rosso dove fast<slow
+        y_upper_r = np.where(fast < slow, slow, np.nan)
+        y_lower_r = np.where(fast < slow, fast, np.nan)
+        fig.add_trace(go.Scatter(x=data.index, y=y_upper_r, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=data.index, y=y_lower_r, line=dict(width=0), showlegend=False, hoverinfo="skip",
+            fill="tonexty", fillcolor="rgba(200, 0, 0, 0.10)", name="Zona fast<slow"
+        ))
+
+        # Marker crossover
+        cross_up = data[(fast > slow) & (fast.shift(1) <= slow.shift(1))]
+        cross_down = data[(fast < slow) & (fast.shift(1) >= slow.shift(1))]
+        if not cross_up.empty:
+            fig.add_trace(go.Scatter(
+                x=cross_up.index, y=cross_up["Close"], name="Golden Cross",
+                mode="markers", marker=dict(color="cyan", size=10, symbol="triangle-up")
+            ))
+        if not cross_down.empty:
+            fig.add_trace(go.Scatter(
+                x=cross_down.index, y=cross_down["Close"], name="Death Cross",
+                mode="markers", marker=dict(color="red", size=10, symbol="triangle-down")
+            ))
+
+        fig.update_layout(
+            template="plotly_dark", height=460,
+            margin=dict(t=20, l=10, r=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_macd = go.Figure()
-            fig_macd.add_trace(go.Scatter(x=data.index, y=data["MACD"], name="MACD", mode="lines"))
-            fig_macd.add_trace(go.Scatter(x=data.index, y=data["MACD_signal"], name="Signal", mode="lines"))
-            fig_macd.add_trace(go.Bar(x=data.index, y=data["MACD_hist"], name="Hist", marker_color="#6aa84f"))
-            fig_macd.update_layout(template="plotly_dark", height=260, margin=dict(t=20,l=10,r=10,b=10))
-            st.plotly_chart(fig_macd, use_container_width=True)
-        with c2:
-            fig_rsi = go.Figure()
-            fig_rsi.add_trace(go.Scatter(x=data.index, y=data["RSI14"], name="RSI(14)", mode="lines"))
-            fig_rsi.add_hline(y=70, line=dict(color="#a64d79", dash="dash"))
-            fig_rsi.add_hline(y=30, line=dict(color="#3d85c6", dash="dash"))
-            fig_rsi.update_layout(template="plotly_dark", height=260, margin=dict(t=20,l=10,r=10,b=10),
-                                  yaxis=dict(range=[0,100]))
-            st.plotly_chart(fig_rsi, use_container_width=True)
+        # (Opzionale) mini-subplot con lo spread
+        with st.expander("Mostra spread EMA_fast - EMA_slow"):
+            fig_spread = go.Figure()
+            fig_spread.add_trace(go.Scatter(
+                x=data.index, y=spread, name="Spread (fast - slow)",
+                mode="lines", line=dict(color="#9ecbff", width=2)
+            ))
+            fig_spread.add_hline(y=0, line=dict(color="#888", dash="dot"))
+            fig_spread.update_layout(template="plotly_dark", height=220, margin=dict(t=10,l=10,r=10,b=10))
+            st.plotly_chart(fig_spread, use_container_width=True)
 
     # FONDAMENTALE (pesi custom)
     with tab2:
@@ -795,14 +820,14 @@ if run_analysis or "last_signal" not in st.session_state:
             try:
                 df_earn = yf.Ticker(ticker).earnings
                 if isinstance(df_earn, pd.DataFrame) and not df_earn.empty:
-                    fig = go.Figure()
+                    fig_a = go.Figure()
                     if "Revenue" in df_earn.columns:
-                        fig.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Revenue"], name="Revenue"))
+                        fig_a.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Revenue"], name="Revenue"))
                     if "Earnings" in df_earn.columns:
-                        fig.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Earnings"], name="Earnings"))
-                    fig.update_layout(template="plotly_dark", barmode="group", height=320,
+                        fig_a.add_trace(go.Bar(x=df_earn.index.astype(str), y=df_earn["Earnings"], name="Earnings"))
+                    fig_a.update_layout(template="plotly_dark", barmode="group", height=320,
                                       margin=dict(t=10,l=10,r=10,b=10))
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig_a, use_container_width=True)
                 else:
                     st.info("Dati annuali non disponibili.")
             except Exception as e:
