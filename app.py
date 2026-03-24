@@ -1,5 +1,7 @@
-# app.py
+# Write the generated Streamlit app with advanced watchlist to app.py
+app_code = r'''# app.py
 import re
+import io
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -363,12 +365,83 @@ def compute_weighted_score(criteria: dict, weights_norm: dict) -> tuple[float, s
     return total_score, band, reasons, contributions
 
 # =========================
-# COSTANTI
+# WATCHLIST AVANZATA
 # =========================
-HEATMAP_TICKERS = ["AAPL","MSFT","TSLA","AMZN","GOOGL","META","NVDA","NFLX","BBVA"]
+DEFAULT_WATCHLIST = [
+    # Mega Cap USA
+    "AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA",
+    # ETF
+    "SPY","QQQ","IWM","DIA",
+    # Bancari
+    "JPM","BAC","C","WFC",
+    # Energia
+    "XOM","CVX","COP",
+    # Europa (alcuni esempi)
+    "RACE","SAP.DE","MBG.DE","NESN.SW","NOVN.SW",
+    # Crypto
+    "BTC-USD","ETH-USD"
+]
+
+PRESET_LISTS = {
+    "Default MegaCaps": DEFAULT_WATCHLIST,
+    "Tech & AI": [
+        "AAPL","MSFT","GOOGL","META","NVDA","TSLA","AMD","AVGO","ADBE","CRM","SNOW","PLTR","SMCI"
+    ],
+    "Dow Jones 30 (subset)": [
+        "AAPL","MSFT","CRM","MCD","V","JNJ","PG","HD","UNH","VZ","INTC","CSCO"
+    ],
+    "ETF & Crypto": ["SPY","QQQ","IWM","DIA","BTC-USD","ETH-USD","GLD","TLT"],
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sp500_from_wikipedia() -> list:
+    """Prova a caricare la lista S&P500 da Wikipedia. Se fallisce, ritorna []."""
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        df = pd.read_html(url)[0]
+        syms = df["Symbol"].astype(str).str.strip().tolist()
+        # Alcuni simboli hanno "." come separatore su Yahoo -> converti a '-'
+        syms = [s.replace(".", "-") for s in syms]
+        return syms
+    except Exception:
+        return []
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nasdaq100_from_wikipedia() -> list:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        tables = pd.read_html(url)
+        # In genere la 1a o 2a tabella contiene i componenti
+        for df in tables:
+            if "Ticker" in df.columns or "Symbol" in df.columns:
+                col = "Ticker" if "Ticker" in df.columns else "Symbol"
+                syms = df[col].astype(str).str.strip().tolist()
+                syms = [s.replace(".", "-") for s in syms]
+                # Filtro simboli strani
+                syms = [s for s in syms if len(s) > 0 and len(s) <= 10]
+                if len(syms) >= 50:
+                    return syms
+        return []
+    except Exception:
+        return []
+
+def normalize_ticker_list(raw_list: list[str]) -> list[str]:
+    seen = set()
+    cleaned = []
+    for t in raw_list:
+        t2 = t.strip().upper()
+        if not t2:
+            continue
+        # Consenti lettere, numeri, trattino, punto
+        if re.fullmatch(r"[A-Z0-9\-\.]+", t2) is None:
+            continue
+        if t2 not in seen:
+            seen.add(t2)
+            cleaned.append(t2)
+    return cleaned
 
 # =========================
-# CACHE LAYER
+# CACHE LAYER (dati prezzo e heatmap)
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)  # 5 minuti
 def build_heatmap_df(tickers: list) -> pd.DataFrame:
@@ -401,60 +474,81 @@ def get_history_normalized(ticker: str, period: str) -> pd.DataFrame:
     return normalize_ohlcv(raw)
 
 # =========================
-# LAYOUT: HEATMAP + CONTROLLI AFFIANCATI
+# LAYOUT: HEATMAP + CONTROLLI AFFIANCATI (con Watchlist avanzata)
 # =========================
 left, right = st.columns([3, 1], gap="large")
 
-with left:
-    st.subheader("🗺️ Market Heatmap (Daily)")
-    df_heat = build_heatmap_df(HEATMAP_TICKERS)
-
-    if not df_heat.empty:
-        # Percentuale formattata con segno
-        df_heat = df_heat.copy()
-        df_heat["ChangePctStr"] = df_heat["Change"].apply(
-            lambda x: f"+{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) and x >= 0
-            else (f"{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) else "N/A")
-        )
-
-        fig_heat = px.treemap(
-            df_heat,
-            path=["Sector", "Ticker"],
-            values="MarketCap",
-            color="Change",
-            color_continuous_scale=["#b00020", "#222222", "#00a86b"],
-            color_continuous_midpoint=0,
-            custom_data=["ChangePctStr"]
-        )
-        # Testo centrale: ticker (bold) + % sotto
-        fig_heat.data[0].texttemplate = "<b>%{label}</b><br>%{customdata[0]}"
-        fig_heat.data[0].textposition = "middle center"
-        fig_heat.update_traces(textfont=dict(size=16))
-        fig_heat.update_traces(marker=dict(line=dict(width=1, color="rgba(255,255,255,0.15)")))
-        fig_heat.data[0].hovertemplate = (
-            "<b>%{label}</b><br>"
-            "Settore: %{parent}<br>"
-            "Market Cap: %{value:,}<br>"
-            "Performance: %{customdata[0]}<extra></extra>"
-        )
-        fig_heat.update_layout(
-            template="plotly_dark",
-            margin=dict(t=30, l=10, r=10, b=10),
-            height=520,
-            coloraxis_colorbar=dict(
-                title="Δ Giornaliero",
-                tickformat="+.1%",
-                thickness=12,
-                len=0.75
-            )
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
-    else:
-        st.info("Nessun dato disponibile per la heatmap.")
-
 with right:
     st.subheader("⚙️ Impostazioni")
-    ticker = st.selectbox("Seleziona un Titolo", HEATMAP_TICKERS, index=0)
+
+    # --- Watchlist avanzata ---
+    st.markdown("**📋 Watchlist avanzata**")
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = DEFAULT_WATCHLIST
+
+    preset = st.selectbox("Preset watchlist", list(PRESET_LISTS.keys()) + ["S&P 500 (Wikipedia)", "Nasdaq-100 (Wikipedia)", "Custom"], index=0)
+
+    custom_area = st.text_area(
+        "Ticker personalizzati (separati da virgola)",
+        value=",".join(st.session_state["watchlist"]),
+        help="Esempio: AAPL, MSFT, NVDA, SPY, BTC-USD"
+    )
+
+    uploaded = st.file_uploader("(Opzionale) Carica CSV con colonna 'Symbol' o prima colonna", type=["csv"]) 
+
+    col_w1, col_w2 = st.columns(2)
+    with col_w1:
+        include_etf = st.checkbox("+ ETF comuni", value=True)
+        include_crypto = st.checkbox("+ Crypto (BTC/ETH)", value=True)
+    with col_w2:
+        heat_max = st.slider("Max titoli in heatmap", min_value=10, max_value=200, value=60, step=10)
+        
+    apply_watch = st.button("📥 Applica watchlist")
+
+    # Costruzione watchlist
+    final_list = []
+    if preset in PRESET_LISTS:
+        final_list.extend(PRESET_LISTS[preset])
+    elif preset == "S&P 500 (Wikipedia)":
+        final_list.extend(load_sp500_from_wikipedia())
+    elif preset == "Nasdaq-100 (Wikipedia)":
+        final_list.extend(load_nasdaq100_from_wikipedia())
+
+    # Aggiungi custom da textarea
+    if custom_area:
+        user_list = [x.strip() for x in custom_area.split(",")]
+        final_list.extend(user_list)
+
+    # File CSV
+    if uploaded is not None:
+        try:
+            df_up = pd.read_csv(uploaded)
+            if "Symbol" in df_up.columns:
+                final_list.extend(df_up["Symbol"].astype(str).tolist())
+            else:
+                # usa la prima colonna
+                first_col = df_up.columns[0]
+                final_list.extend(df_up[first_col].astype(str).tolist())
+        except Exception as e:
+            st.warning(f"CSV non letto: {e}")
+
+    # Extra inclusioni rapide
+    if include_etf:
+        final_list.extend(["SPY","QQQ","IWM","DIA","XLK","XLF","XLE","XLI","XLV","XLY","XLP","XLB","XLU"])
+    if include_crypto:
+        final_list.extend(["BTC-USD","ETH-USD"]) 
+
+    # Normalizza e limita per heatmap
+    final_list = normalize_ticker_list(final_list)
+    if len(final_list) == 0:
+        final_list = DEFAULT_WATCHLIST
+
+    if apply_watch:
+        st.session_state["watchlist"] = final_list
+        st.success(f"Watchlist aggiornata: {len(final_list)} simboli")
+
+    # Select box del titolo
+    ticker = st.selectbox("Seleziona un Titolo", st.session_state["watchlist"], index=0)
     period = st.selectbox("Periodo", ["3mo","6mo","1y"], index=0)
 
     # Parametri tecnici
@@ -498,6 +592,57 @@ weights_raw = {
     "Dividends": w_div
 }
 weights_norm = {k: (v / (w_sum if w_sum > 0 else 1.0)) for k, v in weights_raw.items()}
+
+with left:
+    st.subheader("🗺️ Market Heatmap (Daily)")
+    # Limita la heatmap ai primi N per market cap (quando disponibile)
+    wl = st.session_state["watchlist"]
+    df_heat = build_heatmap_df(wl)
+
+    if not df_heat.empty:
+        # Ordina per market cap e limita
+        df_heat = df_heat.sort_values("MarketCap", ascending=False).head(heat_max)
+        # Percentuale formattata con segno
+        df_heat = df_heat.copy()
+        df_heat["ChangePctStr"] = df_heat["Change"].apply(
+            lambda x: f"+{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) and x >= 0
+            else (f"{x*100:.2f}%" if isinstance(x, (int, float)) and pd.notna(x) else "N/A")
+        )
+
+        fig_heat = px.treemap(
+            df_heat,
+            path=["Sector", "Ticker"],
+            values="MarketCap",
+            color="Change",
+            color_continuous_scale=["#b00020", "#222222", "#00a86b"],
+            color_continuous_midpoint=0,
+            custom_data=["ChangePctStr"]
+        )
+        # Testo centrale: ticker (bold) + % sotto
+        fig_heat.data[0].texttemplate = "<b>%{label}</b><br>%{customdata[0]}"
+        fig_heat.data[0].textposition = "middle center"
+        fig_heat.update_traces(textfont=dict(size=16))
+        fig_heat.update_traces(marker=dict(line=dict(width=1, color="rgba(255,255,255,0.15)")))
+        fig_heat.data[0].hovertemplate = (
+            "<b>%{label}</b><br>"
+            "Settore: %{parent}<br>"
+            "Market Cap: %{value:,}<br>"
+            "Performance: %{customdata[0]}<extra></extra>"
+        )
+        fig_heat.update_layout(
+            template="plotly_dark",
+            margin=dict(t=30, l=10, r=10, b=10),
+            height=520,
+            coloraxis_colorbar=dict(
+                title="Δ Giornaliero",
+                tickformat="+.1%",
+                thickness=12,
+                len=0.75
+            )
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+    else:
+        st.info("Nessun dato disponibile per la heatmap.")
 
 st.markdown("---")
 
@@ -613,10 +758,24 @@ if run_analysis or "last_signal" not in st.session_state:
     else:
         final_signal = "HOLD"
 
+    # =========================
+    # SEGNALE STORICO (serie BUY/SELL/HOLD) per grafico e backtest
+    # =========================
+    df = data.copy()
+    cond_up = (df["EMA_fast"] > df["EMA_slow"]) & (df["Close"] > df["KC_mid"]) \
+              & (df["MACD"] > df["MACD_signal"]) & ((df["RSI14"] > 50) if use_rsi else True)
+    cond_down = (df["EMA_fast"] < df["EMA_slow"]) & (df["Close"] < df["KC_mid"]) \
+                & (df["MACD"] < df["MACD_signal"]) & ((df["RSI14"] < 50) if use_rsi else True)
+
+    df["Signal"] = np.where(cond_up, "BUY", np.where(cond_down, "SELL", "HOLD"))
+    df["Position"] = df["Signal"].replace({"BUY":1, "SELL":-1, "HOLD":0}).shift(1).fillna(0)
+    df["CrossUp"] = (df["EMA_fast"] > df["EMA_slow"]) & (df["EMA_fast"].shift(1) <= df["EMA_slow"].shift(1))
+    df["CrossDown"] = (df["EMA_fast"] < df["EMA_slow"]) & (df["EMA_fast"].shift(1) >= df["EMA_slow"].shift(1))
+
     # ===== TABS =====
     tab1, tab2, tab3, tab4 = st.tabs(["📈 Tecnica", "📊 Fondamentale", "🎯 Consiglio", "📚 Backtest"])
 
-    # TECNICA — grafico migliorato per leggere EMA_fast > EMA_slow
+    # TECNICA — grafico migliorato per leggere EMA_fast > EMA_slow + segnali
     with tab1:
         st.subheader("Analisi Tecnica (Trend + EMA spread)")
         st.write(
@@ -626,8 +785,7 @@ if run_analysis or "last_signal" not in st.session_state:
             f"Δ: **{(data['EMA_fast'].iloc[-1] - data['EMA_slow'].iloc[-1]):.2f}**"
         )
 
-        fast = data["EMA_fast"]
-        slow = data["EMA_slow"]
+        fast = data["EMA_fast"]; slow = data["EMA_slow"]
         spread = fast - slow
 
         fig = go.Figure()
@@ -655,7 +813,6 @@ if run_analysis or "last_signal" not in st.session_state:
             x=data.index, y=y_lower, line=dict(width=0), showlegend=False, hoverinfo="skip",
             fill="tonexty", fillcolor="rgba(0, 170, 0, 0.10)", name="Zona fast>slow"
         ))
-
         # Fill rosso dove fast<slow
         y_upper_r = np.where(fast < slow, slow, np.nan)
         y_lower_r = np.where(fast < slow, fast, np.nan)
@@ -665,18 +822,22 @@ if run_analysis or "last_signal" not in st.session_state:
             fill="tonexty", fillcolor="rgba(200, 0, 0, 0.10)", name="Zona fast<slow"
         ))
 
-        # Marker crossover
-        cross_up = data[(fast > slow) & (fast.shift(1) <= slow.shift(1))]
-        cross_down = data[(fast < slow) & (fast.shift(1) >= slow.shift(1))]
-        if not cross_up.empty:
+        # Marker segnali operativi
+        sig_buy_points = df[df["Signal"] == "BUY"]
+        sig_sell_points = df[df["Signal"] == "SELL"]
+        if not sig_buy_points.empty:
             fig.add_trace(go.Scatter(
-                x=cross_up.index, y=cross_up["Close"], name="Golden Cross",
-                mode="markers", marker=dict(color="cyan", size=10, symbol="triangle-up")
+                x=sig_buy_points.index, y=sig_buy_points["Close"],
+                name="Signal BUY", mode="markers",
+                marker=dict(color="#00c853", size=9, symbol="circle"),
+                hovertemplate="BUY %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"
             ))
-        if not cross_down.empty:
+        if not sig_sell_points.empty:
             fig.add_trace(go.Scatter(
-                x=cross_down.index, y=cross_down["Close"], name="Death Cross",
-                mode="markers", marker=dict(color="red", size=10, symbol="triangle-down")
+                x=sig_sell_points.index, y=sig_sell_points["Close"],
+                name="Signal SELL", mode="markers",
+                marker=dict(color="#d50000", size=9, symbol="x"),
+                hovertemplate="SELL %{x|%Y-%m-%d}<br>Prezzo: %{y:.2f}<extra></extra>"
             ))
 
         fig.update_layout(
@@ -686,16 +847,21 @@ if run_analysis or "last_signal" not in st.session_state:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # (Opzionale) mini-subplot con lo spread
-        with st.expander("Mostra spread EMA_fast - EMA_slow"):
-            fig_spread = go.Figure()
-            fig_spread.add_trace(go.Scatter(
-                x=data.index, y=spread, name="Spread (fast - slow)",
-                mode="lines", line=dict(color="#9ecbff", width=2)
-            ))
-            fig_spread.add_hline(y=0, line=dict(color="#888", dash="dot"))
-            fig_spread.update_layout(template="plotly_dark", height=220, margin=dict(t=10,l=10,r=10,b=10))
-            st.plotly_chart(fig_spread, use_container_width=True)
+        # Elenco segnali + download
+        with st.expander("🧾 Elenco segnali (storico) + download"):
+            sig_df = df.loc[(df["Signal"].shift(1) != df["Signal"]) | (df.index == df.index[0])].copy()
+            sig_df = sig_df[["Signal", "Close", "EMA_fast", "EMA_slow", "MACD", "MACD_signal", "RSI14"]]
+            sig_df = sig_df.rename(columns={
+                "Close":"Prezzo", "EMA_fast":f"EMA{int(ema_fast)}", "EMA_slow":f"EMA{int(ema_slow)}"
+            })
+            st.dataframe(sig_df.tail(30))
+            csv = sig_df.to_csv(index=True).encode("utf-8")
+            st.download_button(
+                label="⬇️ Scarica segnali (CSV)",
+                data=csv,
+                file_name=f"signals_{ticker}_{period}.csv",
+                mime="text/csv"
+            )
 
     # FONDAMENTALE (pesi custom)
     with tab2:
@@ -881,23 +1047,7 @@ if run_analysis or "last_signal" not in st.session_state:
     # BACKTEST
     with tab4:
         st.subheader("📚 Backtest")
-        df = data.copy()
-        cond_up = (df["EMA_fast"] > df["EMA_slow"]) & (df["Close"] > df["KC_mid"])
-        cond_down = (df["EMA_fast"] < df["EMA_slow"]) & (df["Close"] < df["KC_mid"])
-        cond_macd_bull_s = (df["MACD"] > df["MACD_signal"])
-        cond_macd_bear_s = (df["MACD"] < df["MACD_signal"])
-        if use_rsi:
-            cond_rsi_bull_s = (df["RSI14"] > 50)
-            cond_rsi_bear_s = (df["RSI14"] < 50)
-        else:
-            cond_rsi_bull_s = pd.Series(True, index=df.index)
-            cond_rsi_bear_s = pd.Series(True, index=df.index)
-
-        sig_buy = cond_up & cond_macd_bull_s & cond_rsi_bull_s
-        sig_sell = cond_down & cond_macd_bear_s & cond_rsi_bear_s
-        signals = pd.Series(np.where(sig_buy, "BUY", np.where(sig_sell, "SELL", "HOLD")), index=df.index)
-
-        metrics, bt = backtest_from_signals(df["Close"], signals, allow_short=allow_short, fee_bps=float(fee_bps))
+        metrics, bt = backtest_from_signals(df["Close"], df["Signal"], allow_short=allow_short, fee_bps=float(fee_bps))
 
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
         kpi1.metric("CAGR", f"{metrics['cagr']*100:,.2f}%" if pd.notna(metrics['cagr']) else "N/A")
@@ -923,3 +1073,9 @@ if run_analysis or "last_signal" not in st.session_state:
         with st.expander("Dettagli numerici"):
             st.dataframe(bt.tail(10))
             st.json(metrics)
+'''
+
+with open('app.py', 'w', encoding='utf-8') as f:
+    f.write(app_code)
+
+print('app.py written successfully with advanced watchlist.')
